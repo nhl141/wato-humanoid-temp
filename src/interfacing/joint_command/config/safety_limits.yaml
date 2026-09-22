@@ -2,50 +2,93 @@ safety:
   units:
     angle: "deg"
     velocity: "deg_s"
-    # mit_kp/mit_kd: only used when joint_command.yaml's control_type is MIT_CONTROL (0).
-    # Per-motor units (kp in [0,500], kd in [0,5] for AK-series -- see
-    # can/config/mit_profiles.yaml). Unset/0 (the default below) is a deliberate safe no-op:
-    # zero stiffness/damping means the joint stays free even under MIT_CONTROL. Set explicitly
-    # per joint to enable compliant holding; start LOW (e.g. kp<10) and increase gradually.
 
-  # NOTE (test config): position clamp is DISABLED. Originally this was because
-  # hardware_mapping.yaml's limits were unmeasured placeholders (±90 etc); that's no
-  # longer true -- calibrate_arm.py's software zero-mode has now been run for real,
-  # producing real per-joint limits (see hardware_mapping.yaml). TODO: re-enable
-  # enable_position_clamp:true now that proper calibration is in place, and re-verify
-  # each joint's limits are current before flipping it (re-run calibration after any
-  # power cycle first -- see hardware_mapping.yaml's header note on encoder drift).
-  # velocity_max is still a deliberate slow crawl for testing; raise once trusted.
+  # HOW THE PIPELINE MODERATES EACH JOINT, in order, once per CONTROL TICK (control_rate_hz in
+  # joint_command.yaml -- NOT once per incoming ArmPose):
+  #   1. position clamp   -> hardware_mapping.yaml lower_limit/upper_limit
+  #   2. low-pass         -> smooths the approach (alpha of the PREVIOUS target)
+  #   3. velocity limit   -> at most velocity_max/control_rate_hz degrees this tick
+  #   4. delta limit      -> hard per-tick backstop, independent of the rate
+  #   5. position clamp   -> limits still hold after smoothing
+  #   6. calibration      -> direction * (q - zero_offset), then published as MotorCmd
+  # Because the limiter runs on the tick, velocity_max is a TRUE degrees-per-second bound:
+  # streaming ArmPose faster no longer makes the arm move faster, and one ArmPose is enough
+  # for the arm to ramp all the way to it (it used to advance one step per message).
+  #
+  # The low-pass runs BEFORE the rate clamps. The other way round it shrank every step the
+  # velocity limiter had just sized, so the real top speed was (1 - alpha) * velocity_max --
+  # 6 deg/s where this file said 40.
   global:
-    enable_position_clamp: false
+    enable_position_clamp: true
     enable_velocity_limit: true
     enable_delta_limit: true
     enable_low_pass: true
-    velocity_max: 40.0
+    # 10 deg/s is a deliberate crawl, and is now honest: it matches the ~6 deg/s the arm
+    # actually moved at before the ordering fix. Raise it once the limits below are trusted.
+    velocity_max: 10.0
     delta_max: 2.4
     low_pass_alpha: 0.85
-    mit_kp: 0.0   # 0 = MIT_CONTROL is a safe no-op until set per-joint below
+    # control_type: -1 means "use joint_command.yaml's control_type". Set per joint below for
+    # motors that need a different one (the GL40 wrist runs MIT; the AK joints run
+    # POSITION_LOOP, which has no gains).
+    control_type: -1
+    # MIT gains: 0 = safe no-op (zero stiffness AND damping means the motor is free). Only
+    # meaningful on joints whose control_type is 0.
+    mit_kp: 0.0
     mit_kd: 0.0
+    mit_max_torque: 0.3
+    mit_max_track_err: 12.0
+    mit_feedback_timeout: 0.2
 
   joints:
+    # --- AK10-9 / AK80-9, servo POSITION_LOOP ------------------------------
+    # Limits come from calibrate_arm.py's software zero-mode (see hardware_mapping.yaml).
+    # Re-run calibration after any power cycle: AK80-9 joints lose their zero (ARM_BRINGUP.md).
     shoulder:
       pitch:
-        velocity_max: 40.0
+        velocity_max: 10.0
         delta_max: 2.0
       roll:
-        velocity_max: 40.0
+        velocity_max: 10.0
         delta_max: 2.0
       yaw:
-        velocity_max: 40.0
+        velocity_max: 10.0
         delta_max: 2.0
     elbow:
       pitch:
-        velocity_max: 40.0
+        velocity_max: 10.0
         delta_max: 1.6
       roll:
-        velocity_max: 40.0
+        velocity_max: 10.0
         delta_max: 1.6
+
+    # --- GL40 KV70 on a GL II drive, MIT_CONTROL ---------------------------
+    # This joint is a PD drive: the motor applies
+    #   torque = mit_kp * (target - actual) + mit_kd * (0 - velocity)
+    # and has NO internal limit checking, so mit_max_* below are the only protection.
+    #
+    # Gains: bench session 2026-09-19 on motor 22 (gl40_mit_mode_explainer.md). kp is quantised
+    # to the drive's 12-bit code (500/4096 = 0.1221 N.m/rad per count), so 1.22 -> raw 10 ->
+    # 1.2207 applied. kd must be non-zero: the GL II manual warns kd = 0 in position control
+    # makes the motor oscillate and run away.
+    #
+    # THE GAIN RULE, enforced at startup (the node refuses to launch if it is violated):
+    #   quantised mit_kp * mit_max_track_err (rad) <= mit_max_torque
+    #   1.2207 * (12 deg = 0.2094 rad) = 0.256 N.m <= 0.3 N.m  OK
+    # The worst case really is a stalled joint: the tracking fault fires at mit_max_track_err,
+    # so the PD torque can never exceed that product. GL40 KV70 is rated 0.25 N.m, peak 0.73;
+    # 0.3 is the testing ceiling from the real-hardware-safety skill.
+    #
+    # Expect a few degrees of steady-state sag under a gravity load -- pure PD under a torque
+    # ceiling cannot do better. Zero steady-state error needs torque feed-forward, which is a
+    # follow-up (see can/README.md).
     wrist:
       pitch:
-        velocity_max: 40.0
+        control_type: 0        # MIT_CONTROL
+        velocity_max: 10.0
         delta_max: 2.4
+        mit_kp: 1.22           # N.m/rad  -> raw 10 -> 1.2207 applied
+        mit_kd: 0.0098         # N.m.s/rad -> raw 8 -> 0.00977 applied
+        mit_max_torque: 0.3    # N.m, fault above
+        mit_max_track_err: 12.0  # deg, fault above
+        mit_feedback_timeout: 0.2  # s without feedback -> fault

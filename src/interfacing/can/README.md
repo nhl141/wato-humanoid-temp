@@ -32,39 +32,86 @@ python3 /root/ament_ws/src/interfacing/can/scripts/calibrate_arm.py \
 ```
 Prompt: **Enter**=yes · id=correct id · **s**=skip · **q**=quit.
 
-### GL40 II in MIT mode — bench only (`gl40_mit_move.py`)
+### GL40 II in MIT mode (`gl40_mit_move.py`, `gl40_bench.py`)
 
-The wrist/gripper GL40s use CubeMars' **GL II gimbal drive**, which in MIT mode speaks
-*standard* 11-bit frames (`ID = node id`, feedback on the master id, default `0x000`) with the
-canonical `pos(16) vel(12) kp(12) kd(12) t_ff(12)` byte order
+The wrist (id 22) and gripper (id 21) GL40s use CubeMars' **GL II gimbal drive**, which in MIT
+mode speaks *standard* 11-bit frames (`ID = node id`, feedback on the master id, default
+`0x000`) with the byte order `pos(16) vel(12) kp(12) kd(12) t_ff(12)`
 ([manual §5](https://www.cubemars.com/images/file/20241231/1735633965678815.pdf)).
-`can_node`'s `MIT_CONTROL` cannot drive it yet: `humanoid.dbc` packs `kp,kd,pos,vel,t`, every TX
-frame is sent as an extended id, there is no GL40 entry in `config/mit_profiles.yaml`, no
-enter/exit-motor-mode frames, and MIT feedback is not decoded. Until that is fixed, use the
-raw-SocketCAN bench script (stdlib only, no ROS; needs `can0` up, i.e. `can_node` running or
-`setup_can.sh`). Make sure `joint_command_node` is **not** running.
+
+**`can_node` now drives them.** `humanoid.dbc` lays `MITControlCmd` out in the protocol's order
+as a standard-id message, `config/mit_profiles.yaml` has entries for ids 21/22 (`family: gl2`),
+`MotorCmd` carries `MIT_ENTER/EXIT/SET_ZERO/CLEAR_ERRORS` (the `FF..FC/FD/FE/FB` frames), and
+MIT feedback on the master id is decoded into `MotorFeedback` (with `torque`). Gains sent as
+`MotorCmd.kp/kd` are snapped to the drive's nearest 12-bit code — truncating, as the manual's
+reference code does, would silently apply up to a full count less (kp 0.61 → 0.488).
+
+The raw-SocketCAN bench tools remain, for one motor at a time without ROS in the way:
 
 ```bash
-S=/root/ament_ws/src/interfacing/can/scripts/gl40_mit_move.py   # /root/ament_ws is root-only in the container -> sudo
-sudo python3 $S --selftest             # frame packing vs. manual example (no bus)
-sudo python3 $S --id 22 --monitor      # zero torque; turn the shaft by hand, check the rad scale
-sudo python3 $S --id 22 --deg 40 --dry-run  # print frames only
-sudo python3 $S --id 22 --deg 40       # +40° from the current position, then go limp (--hold to stay)
+S=/root/ament_ws/src/interfacing/can/scripts   # /root/ament_ws is root-only -> sudo
+sudo python3 $S/gl40_mit_move.py --selftest                 # packing vs the manual (no bus)
+sudo python3 $S/gl40_mit_move.py --id 22 --monitor          # zero torque; check the rad scale
+sudo python3 $S/gl40_mit_move.py --id 22 --deg 40 --dry-run # print frames only
+sudo python3 $S/gl40_mit_move.py --id 22 --deg 40 --kp 1.22 --max-track-err 12 --hold
+sudo python3 $S/gl40_bench.py    --id 22 --step 5 --sweep "0.61,1.22,1.34"   # gain sweep
 ```
 
-It reads the position first, holds it for 1 s, ramps the setpoint (≤ 1 rad/s, default 40° in 4 s),
-and frees the motor on Ctrl-C or on any abort (torque > 0.3 N·m, tracking error > 15°, > 60 °C,
-drive error, 200 ms without feedback). Gains are snapped to the drive's 12-bit codes (kp 0.122,
-kd 0.0012 N·m per count) and must satisfy `kp × max-track-err ≤ max-torque` (a stalled motor is the
-worst case: the tracking abort caps the PD torque). Defaults **kp raw 3 = 0.366 N·m/rad, kd raw 8 =
-0.0098 N·m·s/rad** (GL40 KV70 rated 0.25 / peak 0.73 N·m; the manual's own example is 0.123 / 0.005;
-kd must be non-zero). Bench result 2026-09-19, id 22: the shaft had a ~0.05 N·m restoring load, so
-kp 0.366 lagged >15° and aborted; kp 0.49 held with a 6° sag; `--kp 1.22 --max-track-err 12 --hold`
-(worst case 0.26 N·m) moved +34° and held steady at 0.125 N·m with a 5.8° sag — pure PD under the
-0.3 N·m ceiling cannot do better against that load; use `--hold`, since the shaft falls back to its
-rest position as soon as the motor is freed, and add torque feed-forward or the drive's
-position-velocity mode if zero steady-state error is needed. `--p-max/--v-max/--t-max` must match the
-drive's parameter page (defaults ±12.5 rad / ±200 / ±10 N·m) — `--monitor` is the way to check `--p-max`.
+It reads the position first, holds it, ramps the setpoint (≤ 1 rad/s), and frees the motor on
+Ctrl-C or on any abort: torque > 0.3 N·m, tracking error > 15°, shaft velocity > 3 rad/s,
+outside `--soft-limits`, > 60 °C, drive error, or 200 ms without feedback. `--soft-limits
+LO,HI` refuses an out-of-range target (or clamps it with `--clamp-target`, which is how limit
+enforcement is demonstrated). Gains must satisfy `kp × max-track-err ≤ max-torque` — a stalled
+motor is the worst case, since the tracking abort caps the PD torque.
+
+**Gains, and where they live now.** The codebase is the source of truth:
+`joint_command/config/safety_limits.yaml` holds the per-joint `mit_kp`/`mit_kd` that
+`joint_command` sends through `MotorCmd`, and the node refuses to start if they violate the
+rule above. Bench result 2026-09-19 on id 22: kp 0.366 lagged > 15° and aborted; kp 0.49 held
+with a 6° sag; **kp 1.22 (raw 10) / kd 0.0098 (raw 8)** with a 12° abort limit moved +34° and
+held steady at 0.125 N·m — those are the shipped values. Expect a few degrees of steady-state
+sag under a gravity load: pure PD under a 0.3 N·m ceiling cannot do better, and closing it
+needs torque feed-forward (not implemented).
+
+`--p-max/--v-max/--t-max` must match the drive's parameter page (defaults ±12.5 rad / ±200 /
+±10 N·m) — `--monitor` is how you check `--p-max`.
+
+### Telemetry and plots
+
+Every move — bench script or ROS pipeline — writes a **run folder** under `outputs/gl40_bench/`
+(gitignored; bind-mounted into the container at `/outputs`):
+
+```
+20260922-190024_id22mp40deg/
+  telemetry.csv   one row per tick per motor: t_s, motor_id, joint, phase, sp_deg, pos_deg,
+                  vel_dps, tau_nm, current_a, drive_c, motor_c, status
+  run.json        gains (requested + as quantised), limits, rates, git sha, abort reason
+  angle.png tracking.png velocity.png torque.png summary.md
+```
+
+Logging is on by default and needs no flag (`--no-log` opts out). Plotting runs on the **host**:
+the robot-control image has no matplotlib/numpy on purpose, so `uv` supplies them per run.
+
+```bash
+tools/gl40_move.sh --id 22 --deg 40 --kp 1.22 --max-track-err 12   # move + plot, one command
+tools/gl40_ros_move.sh --pose "0,0,0,0,0,20" --duration 15         # through joint_command
+uv run --with matplotlib --with numpy tools/gl40_telemetry_plot.py outputs/gl40_bench/<run>
+```
+
+Full procedure, including the clamp benchmarks and the no-hardware simulator:
+[TESTING_LIMITS_AND_TELEMETRY.md](../TESTING_LIMITS_AND_TELEMETRY.md).
+
+### No hardware? `gl40_sim.py`
+
+Emulates all seven drives on a virtual CAN bus — five AK in servo mode, two GL II in MIT mode,
+each with inertia, damping and a gravity-like load — so the whole pipeline can be exercised
+before anything is plugged in:
+
+```bash
+sudo ip link add dev vcan0 type vcan; sudo ip link set up vcan0   # once (NET_ADMIN)
+python3 $S/gl40_sim.py --iface vcan0
+ros2 launch can can.launch.py --ros-args -p can_interface:=vcan0 -p bustype:=socketcan
+```
 
 ---
 

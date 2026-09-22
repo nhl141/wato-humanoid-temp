@@ -19,9 +19,13 @@ the defaults are +-12.5 rad / +-200 / +-10 N.m. If the drive is configured diffe
 
 Safety (see .claude/skills/real-hardware-safety/SKILL.md): reads the current position before
 moving, holds there first, ramps the setpoint slowly, refuses gains that could exceed
---max-torque at the commanded error, aborts on torque / tracking-error / temperature / error
-code / lost feedback, and sends "exit motor mode" (motor goes limp) on Ctrl-C or any failure.
-Nothing here replaces a HARDWARE E-STOP on the motor supply.
+--max-torque at the commanded error, clamps every setpoint to --soft-limits, aborts on torque /
+tracking-error / shaft-velocity / soft-limit / temperature / error code / lost feedback, and
+sends "exit motor mode" (motor goes limp) on Ctrl-C or any failure. Nothing here replaces a
+HARDWARE E-STOP on the motor supply.
+
+Every real run writes a telemetry run folder (telemetry.csv + run.json) -- see telemetry.py and
+tools/gl40_telemetry_plot.py for the plots. --no-log opts out.
 
 Examples (inside the interfacing container; can0 is brought up by can_node / setup_can.sh)::
 
@@ -31,6 +35,7 @@ Examples (inside the interfacing container; can0 is brought up by can_node / set
   sudo python3 $S --id 22 --deg 40 --dry-run      # print the frames that would be sent
   sudo python3 $S --id 22 --deg 40                # +40 deg from current position, then go limp
   sudo python3 $S --id 22 --deg 40 --hold         # ...and keep holding until Ctrl-C
+  sudo python3 $S --id 22 --deg 40 --soft-limits 120,200   # ...refusing to leave 120..200 deg
 """
 
 from __future__ import annotations
@@ -44,7 +49,9 @@ import struct
 import sys
 import time
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
+
+from telemetry import RunFolder
 
 # ---------------------------------------------------------------------------
 # Protocol constants (GL II manual §5)
@@ -116,6 +123,29 @@ def pack_mit(p: float, v: float, kp: float, kd: float, t: float, r: MitRanges) -
         ((kd_i & 0xF) << 4) | ((t_i >> 8) & 0xF),
         t_i & 0xFF,
     ])
+
+
+def clamp_setpoint(sp: float, lo: Optional[float], hi: Optional[float]) -> float:
+    """Clamp a commanded position to the soft limits (both in rad, either may be None)."""
+    if lo is not None:
+        sp = max(sp, lo)
+    if hi is not None:
+        sp = min(sp, hi)
+    return sp
+
+
+def outside_soft_limits(pos: float, lo: Optional[float], hi: Optional[float],
+                        margin: float) -> bool:
+    """True if a MEASURED position has escaped the soft limits by more than `margin` rad.
+
+    The margin exists because a PD controller always sags behind its setpoint under load; only
+    a real overshoot past the limit should stop the motor.
+    """
+    if lo is not None and pos < lo - margin:
+        return True
+    if hi is not None and pos > hi + margin:
+        return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -235,11 +265,15 @@ class SafetyLimits:
     max_temp: int              # degC, drive or motor
     feedback_timeout: float    # s of consecutive silence before abort
     max_setpoint_vel: float    # rad/s, upper bound on how fast the setpoint may move
+    max_shaft_vel: float       # rad/s, abort if the DRIVE reports the shaft moving faster
+    soft_lo: Optional[float] = None  # rad, drive frame: hard floor for commanded + measured pos
+    soft_hi: Optional[float] = None  # rad, drive frame: hard ceiling
+    soft_margin: float = 2.0 * DEG   # rad of PD sag allowed past a soft limit before aborting
 
 
 class Motor:
     def __init__(self, bus: CanBus, motor_id: int, master_id: int, ranges: MitRanges,
-                 limits: SafetyLimits):
+                 limits: SafetyLimits, log: Optional[RunFolder] = None, joint: str = ""):
         if not (1 <= motor_id <= 0xFF):
             raise ValueError("motor id must be 1..255")
         self.bus = bus
@@ -247,8 +281,30 @@ class Motor:
         self.master_id = master_id
         self.r = ranges
         self.lim = limits
+        self.log = log
+        self.joint = joint
         self.last_fb: Optional[Feedback] = None
         self.last_fb_time = time.monotonic()
+
+    def record(self, phase: str, setpoint: Optional[float], fb: Optional[Feedback]) -> None:
+        """One telemetry row. Called every tick, with or without fresh feedback."""
+        if self.log is None:
+            return
+        self.log.row(
+            motor_id=self.id,
+            joint=self.joint,
+            phase=phase,
+            sp_deg=None if setpoint is None else setpoint / DEG,
+            pos_deg=None if fb is None else fb.pos / DEG,
+            # The drive's velocity scale is a parameter-page setting and is NOT verified by
+            # default (--monitor is how you check it), so the plotter also differentiates
+            # pos_deg and overlays both traces.
+            vel_dps=None if fb is None else fb.vel / DEG,
+            tau_nm=None if fb is None else fb.torque,
+            drive_c=None if fb is None else fb.drive_temp,
+            motor_c=None if fb is None else fb.motor_temp,
+            status=None if fb is None else fb.err_name,
+        )
 
     # --- raw frames ------------------------------------------------------
     def enter_motor_mode(self) -> None:
@@ -260,6 +316,9 @@ class Motor:
     def command(self, p: float, v: float, kp: float, kd: float, t: float) -> None:
         if abs(p) > self.r.p_max:
             raise Abort(f"refusing setpoint {p:.3f} rad outside +-{self.r.p_max} rad")
+        # Soft limits bind on every frame, not just on the requested target: a ramp that would
+        # walk past the limit simply stops there.
+        p = clamp_setpoint(p, self.lim.soft_lo, self.lim.soft_hi)
         self.bus.send(self.id, pack_mit(p, v, kp, kd, t, self.r))
 
     # --- feedback --------------------------------------------------------
@@ -294,6 +353,15 @@ class Motor:
             raise Abort(f"motor reports error: {fb.err_name}")
         if abs(fb.torque) > self.lim.max_torque:
             raise Abort(f"feedback torque {fb.torque:+.3f} N.m exceeds {self.lim.max_torque} N.m")
+        if abs(fb.vel) > self.lim.max_shaft_vel:
+            raise Abort(f"shaft velocity {fb.vel:+.2f} rad/s exceeds "
+                        f"{self.lim.max_shaft_vel} rad/s")
+        if outside_soft_limits(fb.pos, self.lim.soft_lo, self.lim.soft_hi,
+                               self.lim.soft_margin):
+            raise Abort(f"position {fb.pos / DEG:+.1f} deg escaped the soft limits "
+                        f"[{'-inf' if self.lim.soft_lo is None else f'{self.lim.soft_lo / DEG:+.1f}'}"
+                        f", {'+inf' if self.lim.soft_hi is None else f'{self.lim.soft_hi / DEG:+.1f}'}"
+                        f"] deg")
         if max(fb.drive_temp, fb.motor_temp) > self.lim.max_temp:
             raise Abort(f"temperature {max(fb.drive_temp, fb.motor_temp)} C exceeds "
                         f"{self.lim.max_temp} C")
@@ -352,6 +420,7 @@ def phase_monitor(m: Motor, rate_hz: float = 10.0) -> None:
     while not _stop_requested:
         m.command(0.0, 0.0, 0.0, 0.0, 0.0)
         fb = m.read_feedback(period * 0.8)
+        m.record("monitor", None, fb)
         m.check(fb, None)
         if fb is not None:
             print(f"\r  {fb}", end="", flush=True)
@@ -373,6 +442,9 @@ def phase_servo(m: Motor, start: float, end: float, duration_s: float, kp: float
         sp = start + (end - start) * alpha
         m.command(sp, 0.0, kp, kd, 0.0)
         fb = m.read_feedback(period * 0.8)
+        # Log the setpoint as actually sent (soft limits clamp it) so the plot shows what the
+        # drive was told, not what the ramp wanted.
+        m.record(label, clamp_setpoint(sp, m.lim.soft_lo, m.lim.soft_hi), fb)
         m.check(fb, sp)
         now = time.monotonic()
         if fb is not None and (now - last_print > 0.25 or i == n):
@@ -391,6 +463,17 @@ def phase_free(m: Motor, repeats: int = 3) -> None:
         except Exception as e:  # noqa: BLE001 - never let a failure here mask the original
             print(f"  warning: exit-motor-mode send failed: {e}")
         time.sleep(0.01)
+
+
+def parse_soft_limits(text: Optional[str]) -> Tuple[Optional[float], Optional[float]]:
+    """"LO,HI" in degrees (drive frame) -> (lo, hi) in radians, lowest first."""
+    if not text:
+        return (None, None)
+    parts = [chunk.strip() for chunk in text.split(",")]
+    if len(parts) != 2:
+        raise ValueError("--soft-limits wants exactly LO,HI in degrees, e.g. 120,200")
+    lo, hi = (float(parts[0]) * DEG, float(parts[1]) * DEG)
+    return (min(lo, hi), max(lo, hi))
 
 
 # ---------------------------------------------------------------------------
@@ -424,7 +507,25 @@ def selftest() -> None:
     assert float_to_uint((round(0.61 / kp_step) + 0.5) * kp_step, 0, r.kp_max, 12) == 5
     assert float_to_uint((round(0.366 / kp_step) + 0.5) * kp_step, 0, r.kp_max, 12) == 3
     assert float_to_uint((round(0.0098 / kd_step) + 0.5) * kd_step, 0, r.kd_max, 12) == 8
-    print("selftest OK: packing matches GL II manual §5.5 example and bench feedback capture")
+    # Soft limits: commanded setpoints clamp, measured positions abort only past the margin.
+    lo, hi = 1.0, 2.0
+    assert clamp_setpoint(0.5, lo, hi) == lo and clamp_setpoint(2.5, lo, hi) == hi
+    assert clamp_setpoint(1.5, lo, hi) == 1.5
+    # An open bound clamps on one side only.
+    assert clamp_setpoint(-99.0, None, hi) == -99.0 and clamp_setpoint(99.0, None, hi) == hi
+    assert clamp_setpoint(99.0, lo, None) == 99.0 and clamp_setpoint(-99.0, lo, None) == lo
+    margin = 2.0 * DEG
+    assert not outside_soft_limits(1.5, lo, hi, margin)
+    assert not outside_soft_limits(hi + margin * 0.5, lo, hi, margin), "sag within margin is ok"
+    assert outside_soft_limits(hi + margin * 2, lo, hi, margin)
+    assert outside_soft_limits(lo - margin * 2, lo, hi, margin)
+    assert not outside_soft_limits(-99.0, None, None, margin)
+    # parse_soft_limits round trip (degrees in, radians out, ordered)
+    assert parse_soft_limits("120,200") == (120 * DEG, 200 * DEG)
+    assert parse_soft_limits("200,120") == (120 * DEG, 200 * DEG), "accepts either order"
+    assert parse_soft_limits(None) == (None, None)
+    print("selftest OK: packing matches GL II manual §5.5 example and bench feedback capture; "
+          "soft-limit clamp/abort and gain snapping behave")
 
 
 # ---------------------------------------------------------------------------
@@ -467,6 +568,29 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--max-temp", type=int, default=60, help="degC abort threshold (default 60)")
     ap.add_argument("--max-setpoint-vel", type=float, default=1.0,
                     help="rad/s: --duration is stretched so the ramp never exceeds this (default 1)")
+    ap.add_argument("--max-shaft-vel", type=float, default=3.0,
+                    help="rad/s: abort if the drive reports the shaft moving faster (default 3 "
+                         "= the GL40 testing limit in the real-hardware-safety skill). The "
+                         "drive's velocity scale is a parameter-page setting -- verify it with "
+                         "--monitor before relying on this")
+    ap.add_argument("--soft-limits", metavar="LO,HI",
+                    help="degrees in the DRIVE frame: refuse targets outside, clamp every "
+                         "setpoint to the range, and abort if the shaft escapes it by more "
+                         "than --soft-limit-margin (default: no limits, only the drive's "
+                         "+-p-max packing range applies)")
+    ap.add_argument("--soft-limit-margin", type=float, default=2.0,
+                    help="deg of PD sag tolerated past a soft limit before aborting (default 2)")
+    ap.add_argument("--clamp-target", action="store_true",
+                    help="with --soft-limits: CLAMP an out-of-range target to the limit and "
+                         "move there, instead of refusing the move. This is how you benchmark "
+                         "limit enforcement (command 200 deg, watch the shaft stop at the "
+                         "limit); refusing is the default because it is the safer behaviour")
+    ap.add_argument("--label", default="",
+                    help="name for the telemetry run folder (default: derived from the move)")
+    ap.add_argument("--no-log", action="store_true",
+                    help="skip the telemetry run folder (telemetry is written by default)")
+    ap.add_argument("--joint", default="",
+                    help="joint name recorded in telemetry, e.g. wrist.pitch")
     ap.add_argument("--dry-run", action="store_true",
                     help="print the frames instead of sending them (no feedback -> no move)")
     return ap
@@ -481,10 +605,19 @@ def main(argv=None) -> int:
         build_parser().error("one of --deg / --rad / --monitor / --selftest is required")
 
     ranges = MitRanges(p_max=args.p_max, v_max=args.v_max, t_max=args.t_max)
+    try:
+        soft_lo, soft_hi = parse_soft_limits(args.soft_limits)
+    except ValueError as e:
+        sys.exit(str(e))
     limits = SafetyLimits(max_torque=args.max_torque, max_track_err=args.max_track_err * DEG,
                           max_temp=args.max_temp, feedback_timeout=0.2,
-                          max_setpoint_vel=args.max_setpoint_vel)
+                          max_setpoint_vel=args.max_setpoint_vel,
+                          max_shaft_vel=args.max_shaft_vel,
+                          soft_lo=soft_lo, soft_hi=soft_hi,
+                          soft_margin=args.soft_limit_margin * DEG)
 
+    kp_q = kd_q = 0.0
+    kp_raw = kd_raw = 0
     if not args.monitor:
         if args.kd <= 0.0:
             sys.exit("--kd must be > 0: the GL II manual warns kd=0 in position control "
@@ -518,8 +651,54 @@ def main(argv=None) -> int:
     signal.signal(signal.SIGINT, _on_signal)
     signal.signal(signal.SIGTERM, _on_signal)
 
+    # Open the bus FIRST: CanBus exits if the interface does not exist, and doing that
+    # after creating the run folder leaves an empty one behind for the plotter to trip on.
     bus = CanBus(args.iface, dry_run=args.dry_run)
-    m = Motor(bus, args.id, args.master_id, ranges, limits)
+    if args.label:
+        label = args.label
+    elif args.monitor:
+        label = f"monitor-id{args.id}"
+    else:
+        moved = args.deg if args.deg is not None else (args.rad or 0.0) / DEG
+        label = f"id{args.id}-{moved:+.0f}deg".replace("+", "p").replace("-", "m")
+    log = RunFolder(
+        label=label,
+        source="script",
+        enabled=not (args.no_log or args.dry_run),
+        meta={
+            "tool": "gl40_mit_move.py",
+            "motor_id": args.id,
+            "joint": args.joint,
+            "iface": args.iface,
+            "master_id": args.master_id,
+            "mode": "monitor" if args.monitor else "move",
+            "rate_hz": args.rate,
+            "ranges": {"p_max": args.p_max, "v_max": args.v_max, "t_max": args.t_max},
+            "limits": {
+                "max_torque_nm": args.max_torque,
+                "max_track_err_deg": args.max_track_err,
+                "max_temp_c": args.max_temp,
+                "max_setpoint_vel_rad_s": args.max_setpoint_vel,
+                "max_shaft_vel_rad_s": args.max_shaft_vel,
+                "soft_limits_deg": None if soft_lo is None and soft_hi is None else [
+                    None if soft_lo is None else round(soft_lo / DEG, 3),
+                    None if soft_hi is None else round(soft_hi / DEG, 3),
+                ],
+                "soft_limit_margin_deg": args.soft_limit_margin,
+                "feedback_timeout_s": 0.2,
+            },
+            "gains": None if args.monitor else {
+                "kp_requested": args.kp, "kd_requested": args.kd,
+                "kp_applied": kp_q, "kd_applied": kd_q,
+                "kp_raw": kp_raw, "kd_raw": kd_raw,
+            },
+            "velocity_scale_verified": False,
+        },
+    )
+    if log.enabled:
+        print(log.describe())
+
+    m = Motor(bus, args.id, args.master_id, ranges, limits, log=log, joint=args.joint)
     rc = 0
     try:
         if args.dry_run:
@@ -547,6 +726,19 @@ def main(argv=None) -> int:
             target = cur + target
         if abs(target) > ranges.p_max:
             raise Abort(f"target {target:+.3f} rad is outside the drive's +-{ranges.p_max} rad")
+        clamped = clamp_setpoint(target, soft_lo, soft_hi)
+        if clamped != target:
+            lo_txt = f"{soft_lo / DEG:+.1f}" if soft_lo is not None else "-inf"
+            hi_txt = f"{soft_hi / DEG:+.1f}" if soft_hi is not None else "+inf"
+            if not args.clamp_target:
+                raise Abort(f"target {target / DEG:+.1f} deg is outside --soft-limits "
+                            f"[{lo_txt}, {hi_txt}] deg -- refusing before any motion "
+                            f"(use --clamp-target to move to the limit instead)")
+            print(f"Target {target / DEG:+.1f} deg is outside --soft-limits [{lo_txt}, "
+                  f"{hi_txt}] deg -- CLAMPED to {clamped / DEG:+.1f} deg")
+            log.note(target_clamped_from_deg=round(target / DEG, 3),
+                     target_clamped_to_deg=round(clamped / DEG, 3))
+            target = clamped
         delta = target - cur
         duration = max(args.duration, abs(delta) / limits.max_setpoint_vel)
         print(f"Move: {cur:+.4f} -> {target:+.4f} rad (delta {delta / DEG:+.1f} deg) over "
@@ -577,9 +769,11 @@ def main(argv=None) -> int:
         return 0
     except Abort as e:
         print(f"\nABORT: {e}")
+        log.note(outcome="aborted", abort_reason=str(e))
         rc = 2
     except Exception as e:  # noqa: BLE001
         print(f"\nERROR: {type(e).__name__}: {e}")
+        log.note(outcome="error", abort_reason=f"{type(e).__name__}: {e}")
         rc = 3
     finally:
         # Always leave the motor limp -- including after --hold (Ctrl-C lands here too).
@@ -587,6 +781,14 @@ def main(argv=None) -> int:
             print("Freeing motor (exit motor mode)...")
             phase_free(m)
         bus.close()
+        if m.last_fb is not None:
+            log.note(final_pos_deg=round(m.last_fb.pos / DEG, 3),
+                     final_torque_nm=round(m.last_fb.torque, 4))
+        run_dir = log.close(log.meta.get("outcome", "completed"))
+        if run_dir is not None:
+            print(f"Telemetry: {run_dir}")
+            print(f"  plot with: uv run --with matplotlib --with numpy "
+                  f"tools/gl40_telemetry_plot.py {run_dir}")
     return rc
 
 

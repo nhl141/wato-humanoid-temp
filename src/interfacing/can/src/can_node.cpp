@@ -1,5 +1,7 @@
 #include "can_node.hpp"
+#include <algorithm> // std::copy
 #include <chrono>
+#include <cmath>   // M_PI
 #include <cstring> // Required for std::memcpy
 #include <functional>
 #include <rclcpp/serialization.hpp>
@@ -37,6 +39,7 @@ CanNode::CanNode() : Node("can_node"), can_core(this->get_logger()) {
   this->declare_parameter("bitrate", 500000);
   this->declare_parameter("receive_poll_interval_ms", 10);
   this->declare_parameter("receive_timeout_ms", 10000);
+  this->declare_parameter("mit_master_id", 0);
 
   // Get parameter values
   std::string can_interface = this->get_parameter("can_interface").as_string();
@@ -45,6 +48,7 @@ CanNode::CanNode() : Node("can_node"), can_core(this->get_logger()) {
   int bitrate = this->get_parameter("bitrate").as_int();
 
   int receive_poll_interval_ms = this->get_parameter("receive_poll_interval_ms").as_int();
+  mit_master_id_ = static_cast<int>(this->get_parameter("mit_master_id").as_int());
 
   RCLCPP_INFO(this->get_logger(),
               "Loaded parameters: interface=%s, bustype=%s, bitrate=%d, "
@@ -135,8 +139,8 @@ double CanNode::decodeSignalPhysical(const dbcppp::ISignal* signal, const uint8_
 }
 
 void CanNode::motorCMDCallback(const common_msgs::msg::MotorCmd::SharedPtr msg) {
-  RCLCPP_INFO(this->get_logger(), "Received MotorCMD motor=%d control_type=%d",
-              static_cast<int>(msg->motor_id), static_cast<int>(msg->control_type));
+  RCLCPP_DEBUG(this->get_logger(), "Received MotorCMD motor=%d control_type=%d",
+               static_cast<int>(msg->motor_id), static_cast<int>(msg->control_type));
 
   const dbcppp::IMessage* dbc_msg = nullptr;
 
@@ -230,10 +234,12 @@ void CanNode::motorCMDCallback(const common_msgs::msg::MotorCmd::SharedPtr msg) 
       const MitProfile& p = it->second;
       dbc_msg = can_messages["MITControlCmd"];
       CanMessage can_msg(getMessageId(dbc_msg, msg->motor_id), dbc_msg->MessageSize());
+      // Gains use packMitGain (nearest code): truncation always rounds a gain DOWN, and one
+      // kp count is 0.122 N.m/rad -- kp 0.61 would otherwise be applied as 0.488.
       encodeSignal(findSignalByName(dbc_msg, "MIT_KP"),
-                   static_cast<int64_t>(packMitValue(msg->kp, p.kp_min, p.kp_max, 12)), can_msg);
+                   static_cast<int64_t>(packMitGain(msg->kp, p.kp_max, 12)), can_msg);
       encodeSignal(findSignalByName(dbc_msg, "MIT_KD"),
-                   static_cast<int64_t>(packMitValue(msg->kd, p.kd_min, p.kd_max, 12)), can_msg);
+                   static_cast<int64_t>(packMitGain(msg->kd, p.kd_max, 12)), can_msg);
       encodeSignal(findSignalByName(dbc_msg, "MIT_Position"),
                    static_cast<int64_t>(packMitValue(msg->position, p.p_min, p.p_max, 16)),
                    can_msg);
@@ -243,6 +249,35 @@ void CanNode::motorCMDCallback(const common_msgs::msg::MotorCmd::SharedPtr msg) 
       encodeSignal(findSignalByName(dbc_msg, "MIT_Torque"),
                    static_cast<int64_t>(packMitValue(msg->torque, p.t_min, p.t_max, 12)), can_msg);
       publishCanMessage(can_msg);
+      break;
+    }
+
+    // MIT "special" frames (FF..FF <code>). A GL II drive ignores MIT command frames until it
+    // has been sent ENTER, and goes limp on EXIT -- so these are what arms/frees the wrist and
+    // gripper. Refused without a profile: the same id on an AK drive means something else.
+    case common_msgs::msg::MotorCmd::MIT_ENTER: {
+      sendMitSpecialFrame(msg->motor_id, MIT_SPECIAL_ENTER, "enter motor mode");
+      break;
+    }
+
+    case common_msgs::msg::MotorCmd::MIT_EXIT: {
+      sendMitSpecialFrame(msg->motor_id, MIT_SPECIAL_EXIT, "exit motor mode");
+      break;
+    }
+
+    case common_msgs::msg::MotorCmd::MIT_SET_ZERO: {
+      // Makes the CURRENT shaft position the drive's zero. Every stored calibration for this
+      // joint becomes wrong the moment this is sent, so it is logged at WARN.
+      RCLCPP_WARN(this->get_logger(),
+                  "MIT_SET_ZERO for motor %d: the drive's zero is now wherever the shaft is "
+                  "standing. Re-run calibration for this joint.",
+                  static_cast<int>(msg->motor_id));
+      sendMitSpecialFrame(msg->motor_id, MIT_SPECIAL_SET_ZERO, "set zero");
+      break;
+    }
+
+    case common_msgs::msg::MotorCmd::MIT_CLEAR_ERRORS: {
+      sendMitSpecialFrame(msg->motor_id, MIT_SPECIAL_CLEAR_ERR, "clear errors");
       break;
     }
 
@@ -301,23 +336,19 @@ void CanNode::loadMitProfiles() {
     p.kp_max = n["kp_max"].as<double>();
     p.kd_min = n["kd_min"].as<double>();
     p.kd_max = n["kd_max"].as<double>();
+    p.model = n["model"] ? n["model"].as<std::string>() : std::string("?");
+    const std::string family = n["family"] ? n["family"].as<std::string>() : std::string("ak");
+    if (!mitFamilyFromString(family, p.family)) {
+      RCLCPP_ERROR(this->get_logger(),
+                   "MIT profile for motor %d has unknown family '%s' (expected ak|gl2) -- "
+                   "skipping this motor; MIT_CONTROL for it will be refused.",
+                   motor_id, family.c_str());
+      continue;
+    }
     mit_profiles_[motor_id] = p;
-    RCLCPP_INFO(this->get_logger(), "Loaded MIT profile for motor %d (%s)", motor_id,
-                n["model"] ? n["model"].as<std::string>().c_str() : "?");
+    RCLCPP_INFO(this->get_logger(), "Loaded MIT profile for motor %d (%s, family %s)", motor_id,
+                p.model.c_str(), family.c_str());
   }
-}
-
-// CubeMars AK-series manual (V3.2.0) section 4.2 float_to_uint: clamp phys to [min, max],
-// then raw = (phys - min) * (2^bits / (max - min)). NOT (phys-min)/(max-min)*(2^bits - 1) --
-// matches the manual's example code exactly (verified against its C reference impl).
-uint32_t CanNode::packMitValue(double phys, double min, double max, unsigned bits) {
-  if (phys < min)
-    phys = min;
-  if (phys > max)
-    phys = max;
-  const double span = max - min;
-  const double scale = static_cast<double>(1u << bits) / span;
-  return static_cast<uint32_t>((phys - min) * scale);
 }
 
 void CanNode::encodeSignal(const dbcppp::ISignal* signal, int64_t phys_value, CanMessage& can_msg) {
@@ -335,6 +366,86 @@ int32_t CanNode::getMessageId(const dbcppp::IMessage* msg, int device_id) const 
   return (msg->Id() & 0xFFFFFF00) | (device_id & 0xFF);
 }
 
+void CanNode::sendMitSpecialFrame(int motor_id, uint8_t code, const char* what) {
+  const auto it = mit_profiles_.find(motor_id);
+  if (it == mit_profiles_.end()) {
+    RCLCPP_ERROR(this->get_logger(),
+                 "MIT special frame (%s) requested for motor %d with no MIT profile loaded "
+                 "(see config/mit_profiles.yaml) -- refusing.",
+                 what, motor_id);
+    return;
+  }
+  // Standard 11-bit frame addressed by node id, exactly like a MIT command frame.
+  CanMessage can_msg(motor_id, 8);
+  const auto payload = mitSpecialFrame(code);
+  std::copy(payload.begin(), payload.end(), can_msg.data.begin());
+  RCLCPP_INFO(this->get_logger(), "MIT %s -> motor %d", what, motor_id);
+  publishCanMessage(can_msg);
+}
+
+// MIT feedback is a STANDARD frame on the drive's master id carrying only the low nibble of the
+// motor id, so it cannot be matched through the DBC (whose ids are all extended and fully
+// qualified). Returns true if the frame was consumed as MIT feedback.
+bool CanNode::handleMitFeedback(const CanMessage& message) {
+  if (message.is_extended_id || static_cast<int>(message.id) != mit_master_id_ ||
+      message.data.size() < 8) {
+    return false;
+  }
+
+  const uint8_t id_nibble = message.data[0] & 0xF;
+  const MitProfile* profile = nullptr;
+  int motor_id = -1;
+  for (const auto& [id, p] : mit_profiles_) {
+    if (p.family == MitFamily::Gl2 && (id & 0xF) == id_nibble) {
+      if (profile != nullptr) {
+        RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                              "Two gl2 motors (%d and %d) share CAN id nibble 0x%X -- their MIT "
+                              "feedback is indistinguishable. Renumber one drive.",
+                              motor_id, id, id_nibble);
+        return true;
+      }
+      profile = &p;
+      motor_id = id;
+    }
+  }
+  if (profile == nullptr) {
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                         "MIT feedback on master id 0x%X for unknown motor nibble 0x%X -- no gl2"
+                         " profile matches (see config/mit_profiles.yaml)",
+                         mit_master_id_, id_nibble);
+    return true;
+  }
+
+  const MitFeedback fb = decodeGl2Feedback(message.data.data(), *profile);
+  auto feedback_msg = common_msgs::msg::MotorFeedback();
+  feedback_msg.motor_id = static_cast<int8_t>(motor_id);
+  // Publish DEGREES, matching the servo-mode feedback other joints produce, so downstream
+  // consumers (joint_command's rate-limiter seeding, calibration, telemetry) share one unit.
+  feedback_msg.position = static_cast<float>(fb.position * 180.0 / M_PI);
+  feedback_msg.velocity = static_cast<float>(fb.velocity);
+  feedback_msg.current = 0.0f; // MIT feedback reports torque, not current
+  feedback_msg.torque = static_cast<float>(fb.torque);
+  feedback_msg.temperature = static_cast<int8_t>(fb.drive_temp);
+  feedback_msg.error_code = static_cast<int8_t>(fb.status);
+
+  if (!mitStatusIsOk(fb.status)) {
+    RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                          "Motor %d reports MIT status 0x%X (%s)", motor_id, fb.status,
+                          mitStatusName(fb.status));
+  }
+  RCLCPP_DEBUG(this->get_logger(), "MIT feedback motor %d: pos=%.3f deg tau=%.3f Nm %dC (%s)",
+               motor_id, feedback_msg.position, fb.torque, fb.drive_temp, mitStatusName(fb.status));
+
+  auto pub = std::dynamic_pointer_cast<rclcpp::Publisher<common_msgs::msg::MotorFeedback>>(
+      _publishers["/interfacing/motorFeedback"]);
+  if (pub) {
+    pub->publish(feedback_msg);
+  } else {
+    RCLCPP_ERROR(this->get_logger(), "Publisher for /interfacing/motorFeedback not found");
+  }
+  return true;
+}
+
 void CanNode::receiveCanMessages() {
   std::vector<CanMessage> messages;
   CanMessage msg;
@@ -343,6 +454,12 @@ void CanNode::receiveCanMessages() {
   }
 
   for (const auto& message : messages) {
+    // MIT feedback first: a standard frame on the master id would otherwise be looked up as a
+    // (wrong) DBC base id -- master id 0x000 collides with DutyCycleCmd's base id.
+    if (handleMitFeedback(message)) {
+      continue;
+    }
+
     // all messages are extended frame CAN ids
     int device_id = message.id & 0xFF;
     int base_id = message.id & 0xFFFFFF00;
@@ -362,6 +479,7 @@ void CanNode::receiveCanMessages() {
             decodeSignalPhysical(findSignalByName(dbc_msg, "FbkSpeed"), message.data.data()));
         feedback_msg.current = static_cast<float>(
             decodeSignalPhysical(findSignalByName(dbc_msg, "FbkCurrent"), message.data.data()));
+        feedback_msg.torque = 0.0f; // servo-mode feedback carries current, not torque
         feedback_msg.temperature = static_cast<int8_t>(
             decodeSignalPhysical(findSignalByName(dbc_msg, "FbkTemperature"), message.data.data()));
         feedback_msg.error_code = static_cast<int8_t>(
@@ -389,7 +507,7 @@ void CanNode::receiveCanMessages() {
 void CanNode::publishCanMessage(CanMessage& can_msg) {
   // Send the CAN message
   if (can_core.sendMessage(can_msg)) {
-    RCLCPP_INFO(this->get_logger(), "Sent for CAN message: ID=0x%X", can_msg.id);
+    RCLCPP_DEBUG(this->get_logger(), "Sent CAN message: ID=0x%X", can_msg.id);
   } else {
     RCLCPP_ERROR(this->get_logger(), "Failed to send CAN message: ID=0x%X", can_msg.id);
   }

@@ -1,0 +1,90 @@
+#pragma once
+
+// CubeMars MIT ("Force Control") protocol helpers -- pure functions, no ROS, so they can be
+// unit-tested without a bus (see test/test_mit_protocol.cpp).
+//
+// Two dialects share this frame format:
+//   AK-series manual V3.2.0 section 4.2  (family "ak")
+//   GL II gimbal drive manual V1.0 section 5 (family "gl2" -- the GL40 KV70 wrist/gripper)
+//
+// Command payload (both dialects), 8 bytes:
+//   byte 0: p[15:8]   byte 1: p[7:0]
+//   byte 2: v[11:4]   byte 3: v[3:0]<<4 | kp[11:8]
+//   byte 4: kp[7:0]   byte 5: kd[11:4]
+//   byte 6: kd[3:0]<<4 | t[11:8]        byte 7: t[7:0]
+// The drive then applies  torque = kp*(p_des - p) + kd*(v_des - v) + t_ff.
+//
+// GL II feedback payload, on the drive's master id (default 0x000):
+//   byte 0: status[7:4] | (motor_id & 0xF)
+//   byte 1-2: position(16)   byte 3 + byte4[7:4]: velocity(12)
+//   byte4[3:0] + byte 5: torque(12)
+//   byte 6: drive temp (degC, signed)   byte 7: motor temp (degC, signed)
+
+#include <array>
+#include <cstdint>
+#include <string>
+
+// Special frames: FF FF FF FF FF FF FF <code>.
+inline constexpr uint8_t MIT_SPECIAL_ENTER = 0xFC;     // enter motor mode (enable)
+inline constexpr uint8_t MIT_SPECIAL_EXIT = 0xFD;      // exit motor mode (motor goes limp)
+inline constexpr uint8_t MIT_SPECIAL_SET_ZERO = 0xFE;  // set current position as zero
+inline constexpr uint8_t MIT_SPECIAL_CLEAR_ERR = 0xFB; // clear errors
+
+enum class MitFamily { Ak, Gl2 };
+
+// Per-motor MIT scaling constants -- see config/mit_profiles.yaml. Physical position /
+// velocity / torque / kp / kd MIN..MAX for THIS drive, used to pack floats into the frame's
+// raw fixed-point fields. Differs per model AND per drive configuration.
+struct MitProfile {
+  double p_min{-12.5}, p_max{12.5};
+  double v_min{-200.0}, v_max{200.0};
+  double t_min{-10.0}, t_max{10.0};
+  double kp_min{0.0}, kp_max{500.0};
+  double kd_min{0.0}, kd_max{5.0};
+  MitFamily family{MitFamily::Gl2};
+  std::string model{};
+};
+
+// Decoded GL II feedback frame, in physical units.
+struct MitFeedback {
+  uint8_t id_nibble{0}; // low 4 bits of the motor's CAN id -- the frame carries no more
+  uint8_t status{0};    // 0=Disable 1=Enable 8=over-voltage ... see mitStatusName()
+  double position{0.0}; // rad
+  double velocity{0.0}; // drive units (GL II: "r/s")
+  double torque{0.0};   // N.m
+  int drive_temp{0};    // degC
+  int motor_temp{0};    // degC
+};
+
+// Manual float_to_uint: clamp to [min,max], then (phys - min) * 2^bits / span, TRUNCATED --
+// bit-identical to the manual's reference implementation and to CubeMars' own tooling, so
+// frames match the worked example in the manual. The result is additionally clamped to
+// 2^bits - 1: at phys == max the formula yields exactly 2^bits, which overflows the field and
+// wraps to 0 (i.e. commands the MINIMUM) if left unclamped.
+uint32_t packMitValue(double phys, double min, double max, unsigned bits);
+
+// Gains are quantised much more coarsely than position (kp: 500/4096 = 0.122 N.m/rad per
+// count), and truncation always rounds a gain DOWN -- kp 0.61 would be sent as 0.488, 20% soft.
+// For gains we therefore pick the NEAREST code. Range is [0, max] (gains are unsigned).
+uint32_t packMitGain(double phys, double max, unsigned bits);
+
+// Manual uint_to_float: code * span / (2^bits - 1) + min. Use this to report what the drive
+// actually applies for a given code.
+double unpackMitValue(uint32_t code, double min, double max, unsigned bits);
+
+// Payload for a MIT command frame, in the byte order documented above.
+std::array<uint8_t, 8> packMitCommand(double p, double v, double kp, double kd, double t,
+                                      const MitProfile& profile);
+
+// GL II feedback -> physical units. `data` must hold at least 8 bytes.
+MitFeedback decodeGl2Feedback(const uint8_t* data, const MitProfile& profile);
+
+std::array<uint8_t, 8> mitSpecialFrame(uint8_t code);
+
+const char* mitStatusName(uint8_t status);
+
+// True for the status codes that mean "the drive is healthy" (Disable / Enable).
+bool mitStatusIsOk(uint8_t status);
+
+// "ak" / "gl2" (case-sensitive, as written in mit_profiles.yaml). Unknown -> false.
+bool mitFamilyFromString(const std::string& name, MitFamily& out);

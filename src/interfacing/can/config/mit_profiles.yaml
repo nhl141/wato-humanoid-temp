@@ -1,18 +1,34 @@
-# Per-motor MIT (Force Control) protocol scaling constants, from the CubeMars AK-series
-# manual (V3.2.0, section 4.2 "Parameter Ranges"). These are the physical MIN/MAX each
-# motor model uses to pack floats into the MIT CAN frame's raw fixed-point fields -- they
-# are NOT the same as hardware_mapping.yaml's calibration (zero_offset/direction/limits),
-# which only applies to POSITION_LOOP. Wrong values here would pack an incorrect raw code
-# and command an unintended stiffness/torque/position via MIT_CONTROL.
+# Per-motor MIT (Force Control) protocol scaling constants. These are the physical MIN/MAX each
+# drive uses to pack floats into the MIT CAN frame's raw fixed-point fields -- they are NOT the
+# same as hardware_mapping.yaml's calibration (zero_offset/direction/limits), which only applies
+# to POSITION_LOOP. Wrong values here pack an incorrect raw code and command an unintended
+# stiffness/torque/position via MIT_CONTROL.
 #
-# position (rad), velocity (rad/s), torque (N.m); kp/kd ranges are shared across AK models.
+# They are also PER-DRIVE SETTINGS, visible/editable in the CubeMars upper-computer parameter
+# page. The values below are each family's defaults; if a drive was reconfigured, fix it here or
+# every position sent to it is wrong by the ratio of the ranges.
+#
+# family: selects the frame/feedback dialect can_node speaks to this motor.
+#   ak  -- AK-series (AK10-9 / AK80-9), manual V3.2.0 section 4.2. MIT command frames are
+#          accepted; MIT *feedback* decoding is NOT implemented (these motors run POSITION_LOOP
+#          and report through ServoStatusFeedback instead).
+#   gl2 -- GL II gimbal drive (GL40 KV70), manual V1.0 section 5. Standard 11-bit frames,
+#          feedback on the master id (mit_master_id, default 0x000), decoded by
+#          decodeGl2Feedback(). Needs MIT_ENTER before it accepts commands.
+#
+# position (rad), velocity (rad/s for ak, "r/s" for gl2), torque (N.m); kp/kd ranges are shared.
 # Keyed by motor CAN id (decimal), matching hardware_mapping.yaml's left-arm can_id values.
 
 motors:
   # AK10-9 -- shoulder_pitch (0x0E), shoulder_roll (0x0C)
-  "14": {model: AK10-9, p_min: -12.56, p_max: 12.56, v_min: -28.0, v_max: 28.0, t_min: -54.0, t_max: 54.0, kp_min: 0.0, kp_max: 500.0, kd_min: 0.0, kd_max: 5.0}
-  "12": {model: AK10-9, p_min: -12.56, p_max: 12.56, v_min: -28.0, v_max: 28.0, t_min: -54.0, t_max: 54.0, kp_min: 0.0, kp_max: 500.0, kd_min: 0.0, kd_max: 5.0}
-  # AK80-9 -- shoulder_yaw (0x0D), elbow_pitch (0x0A), elbow_roll (0x0B)
-  "13": {model: AK80-9, p_min: -12.56, p_max: 12.56, v_min: -65.0, v_max: 65.0, t_min: -18.0, t_max: 18.0, kp_min: 0.0, kp_max: 500.0, kd_min: 0.0, kd_max: 5.0}
-  "10": {model: AK80-9, p_min: -12.56, p_max: 12.56, v_min: -65.0, v_max: 65.0, t_min: -18.0, t_max: 18.0, kp_min: 0.0, kp_max: 500.0, kd_min: 0.0, kd_max: 5.0}
-  "11": {model: AK80-9, p_min: -12.56, p_max: 12.56, v_min: -65.0, v_max: 65.0, t_min: -18.0, t_max: 18.0, kp_min: 0.0, kp_max: 500.0, kd_min: 0.0, kd_max: 5.0}
+  "14": {model: AK10-9, family: ak, p_min: -12.56, p_max: 12.56, v_min: -28.0, v_max: 28.0, t_min: -54.0, t_max: 54.0, kp_min: 0.0, kp_max: 500.0, kd_min: 0.0, kd_max: 5.0}
+  "12": {model: AK10-9, family: ak, p_min: -12.56, p_max: 12.56, v_min: -28.0, v_max: 28.0, t_min: -54.0, t_max: 54.0, kp_min: 0.0, kp_max: 500.0, kd_min: 0.0, kd_max: 5.0}
+  # AK80-9 -- shoulder_yaw (0x0B), elbow_pitch (0x0A), elbow_roll (0x0D)
+  "11": {model: AK80-9, family: ak, p_min: -12.56, p_max: 12.56, v_min: -65.0, v_max: 65.0, t_min: -18.0, t_max: 18.0, kp_min: 0.0, kp_max: 500.0, kd_min: 0.0, kd_max: 5.0}
+  "10": {model: AK80-9, family: ak, p_min: -12.56, p_max: 12.56, v_min: -65.0, v_max: 65.0, t_min: -18.0, t_max: 18.0, kp_min: 0.0, kp_max: 500.0, kd_min: 0.0, kd_max: 5.0}
+  "13": {model: AK80-9, family: ak, p_min: -12.56, p_max: 12.56, v_min: -65.0, v_max: 65.0, t_min: -18.0, t_max: 18.0, kp_min: 0.0, kp_max: 500.0, kd_min: 0.0, kd_max: 5.0}
+  # GL40 KV70 (GL II drive) -- wrist_pitch (0x16), gripper open_close (0x15). Manual V1.0 S5
+  # defaults. Verify p_max with `gl40_mit_move.py --id <id> --monitor` (a quarter turn by hand
+  # must read ~1.571 rad) before trusting any position commanded through MIT.
+  "22": {model: GL40-KV70, family: gl2, p_min: -12.5, p_max: 12.5, v_min: -200.0, v_max: 200.0, t_min: -10.0, t_max: 10.0, kp_min: 0.0, kp_max: 500.0, kd_min: 0.0, kd_max: 5.0}
+  "21": {model: GL40-KV70, family: gl2, p_min: -12.5, p_max: 12.5, v_min: -200.0, v_max: 200.0, t_min: -10.0, t_max: 10.0, kp_min: 0.0, kp_max: 500.0, kd_min: 0.0, kd_max: 5.0}
