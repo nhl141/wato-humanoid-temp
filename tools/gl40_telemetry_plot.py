@@ -52,7 +52,8 @@ CRITICAL = "#e34948"   # status colour: reserved for limits/faults, never a seri
 COMMANDED = "#52514e"  # setpoints are reference lines, not an identity
 
 LINE_W = 2.0
-PHASE_BANDS = {"hold": "#f2f1ed", "ramp": "#e8eef8", "settle": "#eef6f2", "step": "#fbeee8"}
+PHASE_BANDS = {"hold": "#f2f1ed", "ramp": "#e8eef8", "settle": "#eef6f2", "step": "#fbeee8",
+               "dwell": "#eef6f2", "return": "#f3ecf7", "rest": "#f2f1ed"}
 
 
 def style_axes(ax, title: str, ylabel: str, xlabel: str = "time (s)") -> None:
@@ -224,12 +225,26 @@ def plot_run(run_dir: Path) -> List[Path]:
 
         lo, hi = joint_limits(meta, motor_id, joint)
         has_limits = limit_lines(ax, lo, hi)
+        # What was ASKED for (ArmPose), before joint_command's clamp and velocity limit. The
+        # y-range is frozen first: an over-extended request just leaves the top of the panel,
+        # which is exactly the picture of the clamp (request goes on, commanded stops at the
+        # limit).
+        raw = [r.get("sp_raw_deg") for r in mrows]
+        has_request = any(v is not None for v in raw)
+        if has_request:
+            y_lo, y_hi = ax.get_ylim()
+            ax.plot(t, raw, color=INK_MUTED, linewidth=1.0, linestyle=(0, (1, 2)),
+                    label="requested", zorder=2)
+            ax.set_ylim(y_lo, y_hi)
         shade_phases(ax, mrows)
         mark_abort(ax, meta, mrows)
 
         handles = [Line2D([], [], color=COMMANDED, linewidth=1.6, linestyle=(0, (5, 3)),
                           label="commanded"),
                    Line2D([], [], color=colour, linewidth=LINE_W, label="measured")]
+        if has_request:
+            handles.insert(0, Line2D([], [], color=INK_MUTED, linewidth=1.0,
+                                     linestyle=(0, (1, 2)), label="requested"))
         if has_limits:
             handles.append(Line2D([], [], color=CRITICAL, linewidth=1.2, linestyle=(0, (6, 4)),
                                   label="joint limit"))

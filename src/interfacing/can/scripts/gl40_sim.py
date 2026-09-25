@@ -7,6 +7,11 @@ exercised end to end before anything is plugged in:
   ids 10-14  AK10-9 / AK80-9 in SERVO mode  -- extended frames (0x400|id position loop,
              0xF00|id disable, ...), ServoStatusFeedback on 0x2900|id, streamed at
              --feedback-hz like a configured drive.
+             With --ak-mode mit they instead emulate MIT mode (AK manual V3.2.0 section 4.2):
+             standard frames on the node id, feedback on the master id with the FULL id in
+             byte 0, a gravity load, and the drive's CAN timeout (--ak-can-timeout): if
+             commands stop, output is cut and the joint falls -- which is what the damp fault
+             action in joint_command exists to prevent.
   ids 21,22  GL40 KV70 on a GL II drive in MIT mode -- standard 11-bit frames on the node id,
              feedback on the master id (0x000), and ONLY when spoken to (exactly like the real
              drive: it answers a frame, it never volunteers). Ignores MIT commands until it
@@ -206,10 +211,65 @@ class Gl2Motor:
         return (master_id, data)
 
 
+@dataclass
+class AkMitMotor(Gl2Motor):
+    """AK drive in MIT mode: same PD/command frame as GL II, AK feedback layout, CAN timeout.
+
+    The feedback layout follows the manual, not a bench capture -- the same caveat as
+    decodeAkFeedback() in mit_protocol.cpp.
+    """
+
+    p_max: float = 12.56
+    v_max: float = 65.0
+    t_max: float = 18.0
+    torque_limit: float = 22.0
+    can_timeout: float = 0.2      # s without a command before the drive cuts output
+    last_rx: float = 0.0
+    timed_out: bool = False
+
+    def handle_command(self, data: bytes) -> None:
+        self.last_rx = time.monotonic()
+        self.timed_out = False
+        super().handle_command(data)
+
+    def step(self, dt: float) -> None:
+        if self.entered and self.can_timeout > 0 and \
+                time.monotonic() - self.last_rx > self.can_timeout:
+            self.timed_out = True
+        if self.timed_out:
+            self.torque = 0.0  # drive cut output: only the load acts
+            self.plant.step(0.0, dt)
+            return
+        super().step(dt)
+
+    def feedback_frame(self, master_id: int):
+        p_i = float_to_uint(self.plant.pos, -self.p_max, self.p_max, 16)
+        v_i = float_to_uint(self.plant.vel, -self.v_max, self.v_max, 12)
+        t_i = float_to_uint(self.torque, -self.t_max, self.t_max, 12)
+        data = bytes([
+            self.motor_id & 0xFF,
+            (p_i >> 8) & 0xFF, p_i & 0xFF,
+            (v_i >> 4) & 0xFF,
+            ((v_i & 0xF) << 4) | ((t_i >> 8) & 0xF),
+            t_i & 0xFF,
+            self.plant.temp_c & 0xFF,
+            0,  # error: none
+        ])
+        return (master_id, data)
+
+
+# Rough gravity load per AK joint in MIT mode (N.m at 90 deg from rest) and peak torque.
+_AK_MIT_PLANT = {
+    14: ("AK10-9", 5.0, 53.0), 12: ("AK10-9", 3.0, 53.0),
+    11: ("AK80-9", 0.5, 22.0), 10: ("AK80-9", 2.0, 22.0), 13: ("AK80-9", 0.3, 22.0),
+}
+
+
 class Simulator:
     def __init__(self, iface: str, master_id: int, feedback_hz: float, load_gain: float,
                  quiet: bool, gl_start_deg: float = 45.0, ak_start_cmd_deg: float = 0.0,
-                 calibration: Optional[Dict[int, tuple]] = None):
+                 calibration: Optional[Dict[int, tuple]] = None, ak_mode: str = "servo",
+                 ak_can_timeout: float = 0.2):
         calibration = calibration or {}
         self.iface = iface
         self.master_id = master_id
@@ -234,6 +294,19 @@ class Simulator:
             motor_deg = direction * (ak_start_cmd_deg - zero_offset)
             motor.plant.pos = motor_deg * DEG
             motor.target_deg = motor_deg
+        # MIT mode: the same joints, now PD drives under a gravity load that rests where the
+        # joint was parked (an unpowered arm hangs there) -- so once commanded away, a dropped
+        # joint visibly falls back.
+        self.ak_mit: Dict[int, AkMitMotor] = {}
+        if ak_mode == "mit":
+            for motor_id, motor in self.ak.items():
+                model, load, peak = _AK_MIT_PLANT[motor_id]
+                start = motor.plant.pos
+                self.ak_mit[motor_id] = AkMitMotor(
+                    motor_id, model=model, torque_limit=peak, can_timeout=ak_can_timeout,
+                    plant=Plant(pos=start, rest=start, load_gain=load,
+                                inertia=0.05, damping=0.2))
+            self.ak = {}
         # The real bench wrist sits near +140 deg on its own scale, which is OUTSIDE the
         # placeholder +-90 limits in hardware_mapping.yaml -- useful for exercising the
         # "joint is outside its own limits" exclusion, but it blocks the joint, so the
@@ -281,15 +354,16 @@ class Simulator:
                 motor.target_deg = motor.plant.pos / DEG  # not modelled; hold
             return
 
-        # Standard frame: a GL II MIT command addressed by node id.
+        # Standard frame: a MIT command (GL II, or AK in --ak-mode mit) addressed by node id.
         node = can_id & CAN_SFF_MASK
-        motor = self.gl.get(node)
+        motor = self.gl.get(node) or self.ak_mit.get(node)
         if motor is None:
             return
         was_entered = motor.entered
         motor.handle_command(bytes(data))
         if motor.entered != was_entered:
-            self.log(f"  [sim] GL40 {node} {'ENTERED motor mode' if motor.entered else 'freed'}")
+            self.log(f"  [sim] {motor.model} {node} "
+                     f"{'ENTERED motor mode' if motor.entered else 'freed'}")
         # The real drive answers every frame it accepts -- including the special frames.
         can_id_fb, payload = motor.feedback_frame(self.master_id)
         self.send(can_id_fb, payload)
@@ -298,7 +372,9 @@ class Simulator:
         dt = 1.0 / rate_hz
         next_fb = time.monotonic()
         next_status = time.monotonic() + 5.0
-        self.log(f"GL II + AK simulator on {self.iface}: AK ids {sorted(self.ak)} (servo), "
+        ak_ids = sorted(self.ak) or sorted(self.ak_mit)
+        ak_mode = "servo" if self.ak else "MIT"
+        self.log(f"GL II + AK simulator on {self.iface}: AK ids {ak_ids} ({ak_mode}), "
                  f"GL40 ids {sorted(self.gl)} (MIT, master id 0x{self.master_id:03X}). Ctrl-C to stop.")
         while not self.stop:
             now = time.monotonic()
@@ -317,6 +393,11 @@ class Simulator:
                 motor.step(dt)
             for motor in self.gl.values():
                 motor.step(dt)
+            for motor in self.ak_mit.values():
+                was_timed_out = motor.timed_out
+                motor.step(dt)
+                if motor.timed_out and not was_timed_out:
+                    self.log(f"  [sim] AK {motor.motor_id} CAN TIMEOUT -- output cut, joint falls")
 
             # AK drives stream status; GL II drives never volunteer one.
             if self.feedback_period is not None and now >= next_fb:
@@ -332,6 +413,10 @@ class Simulator:
                     f"{'' if m.entered else ' (limp)'}" for m in self.gl.values())
                 ak = "  ".join(f"AK{m.motor_id}={m.plant.pos / DEG:+.1f}deg"
                                for m in self.ak.values())
+                ak += "  ".join(
+                    f"AK{m.motor_id}={m.plant.pos / DEG:+.1f}deg tau={m.torque:+.2f}"
+                    f"{' (TIMEOUT)' if m.timed_out else '' if m.entered else ' (limp)'}"
+                    for m in self.ak_mit.values())
                 print(f"  [sim] rx={self.rx} tx={self.tx} | {ak} | {gl}", flush=True)
 
             time.sleep(max(0.0, dt - (time.monotonic() - now)))
@@ -391,6 +476,11 @@ def main(argv=None) -> int:
                     help="COMMAND-frame angle the five AK joints start at (default 0); "
                          "converted to the motor frame with hardware_mapping.yaml")
     ap.add_argument("--mapping", help="hardware_mapping.yaml used for that conversion")
+    ap.add_argument("--ak-mode", choices=("servo", "mit"), default="servo",
+                    help="protocol the five AK drives speak (default servo)")
+    ap.add_argument("--ak-can-timeout", type=float, default=0.2,
+                    help="MIT mode: s without a command before an AK cuts output; 0 disables "
+                         "(default 0.2, the R-Link setting to use on the real drives)")
     ap.add_argument("--arm-side", default="left")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args(argv)
@@ -402,7 +492,8 @@ def main(argv=None) -> int:
                  f"  sudo ip link set up {args.iface}")
 
     sim = Simulator(args.iface, args.master_id, args.feedback_hz, args.load_gain, args.quiet,
-                    args.gl_start_deg, args.ak_start_cmd_deg, load_calibration(args))
+                    args.gl_start_deg, args.ak_start_cmd_deg, load_calibration(args),
+                    args.ak_mode, args.ak_can_timeout)
 
     def on_signal(signum, _frame):
         sim.stop = True

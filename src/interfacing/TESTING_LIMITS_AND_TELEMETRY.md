@@ -1,5 +1,9 @@
 # Testing joint limits, velocity limits, and telemetry plots
 
+> **Running the test?** Use the step-by-step [MIT_CLAMP_TEST.md](MIT_CLAMP_TEST.md): zero at a
+> hand-set pose → move over a duration → hold → return, with over-extended and too-fast requests.
+> This file is the background.
+
 How to prove the arm's safety limits are actually enforced, and how to see it in a plot.
 Covers all **seven** motors: the five AK arm joints, the GL40 wrist, and the GL40 gripper.
 
@@ -246,7 +250,7 @@ Tune gains with a step response (a slow ramp keeps the error near zero, so every
 same):
 
 ```bash
-tools/gl40_move.sh --id 22 --step 5 --kp 1.22 --max-track-err 12          # one step
+GL40_TOOL=gl40_bench.py tools/gl40_move.sh --id 22 --step 5              # one step
 GL40_TOOL=gl40_bench.py tools/gl40_move.sh --id 22 --step 5 \
   --sweep "0.61,0.85,1.22,1.34" --kd-sweep "0.0098,0.0244" --max-track-err 12
 ```
@@ -279,13 +283,29 @@ motion (the bench script, which does not use that file, still drives it).
 
 ## 7. On real hardware, in order
 
-1. `tools/gl40_move.sh --id 22 --selftest` and the gtests in §2 — no bus touched.
-2. `tools/gl40_move.sh --id 22 --monitor` — zero torque. Turn the shaft by hand; a quarter turn
+1. `tools/gl40_move.sh --id 22 --selftest` and the gtests in §2. No bus is touched.
+2. `tools/gl40_move.sh --id 22 --monitor`: zero torque. Turn the shaft by hand; a quarter turn
    must read ≈ 1.571 rad. This is what verifies `--p-max` and the velocity scale.
-3. §3 clamp tests, starting with one joint and a small target.
-4. §4 velocity test.
-5. §6 gain sweep, then write the chosen gains into `safety_limits.yaml` and rebuild.
-6. Keep every run folder — `angle.png` and `summary.md` are the evidence that the limits held.
+3. Calibrate (`calibrate_arm.py`), then **rebuild joint_command**
+   (`./watod build joint_command && ./watod up -d`). The node loads its installed copy of
+   `hardware_mapping.yaml` / `safety_limits.yaml`, and `arm_roundtrip.py` refuses to run while
+   that copy differs from the repo's.
+4. Angle round trips through the teleop path, one joint at a time, lightest load first. Each run
+   goes out, dwells, comes back to its start and settles:
+   ```bash
+   tools/arm_roundtrip.sh --joints elbow.roll     --offset "0,0,0,0,5,0"
+   tools/arm_roundtrip.sh --joints elbow.pitch    --offset "0,0,0,5,0,0"
+   tools/arm_roundtrip.sh --joints shoulder.yaw   --offset "0,0,5,0,0,0"
+   tools/arm_roundtrip.sh --joints shoulder.roll  --offset "0,1.5,0,0,0,0"   # range -7.7..3.7
+   tools/arm_roundtrip.sh --joints shoulder.pitch --offset "3,0,0,0,0,0"     # most gravity load
+   tools/arm_roundtrip.sh --joints wrist.pitch    --offset "0,0,0,0,0,10"
+   ```
+   Grow the offsets toward the benchmark angles, then move all joints together. `summary.md`
+   gives `benchmark_deg`, `steady_state_err_deg` (sag at the target) and `return_err_deg`.
+5. §3 clamp tests, starting with one joint and a small target.
+6. §4 velocity test.
+7. §6 gain sweep, then write the chosen gains into `safety_limits.yaml` and rebuild.
+8. Keep every run folder. `angle.png` and `summary.md` are the evidence that the limits held.
 
 Before each: hardware E-stop within reach, arm clear, nothing else publishing to
 `/arm/joint_targets`, and — for the AK80-9 joints (elbow pitch/roll, shoulder yaw) — recalibrate

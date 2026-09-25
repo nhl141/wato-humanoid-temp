@@ -19,6 +19,15 @@
 //   byte 1-2: position(16)   byte 3 + byte4[7:4]: velocity(12)
 //   byte4[3:0] + byte 5: torque(12)
 //   byte 6: drive temp (degC, signed)   byte 7: motor temp (degC, signed)
+//
+// AK feedback payload (manual V3.2.0 section 4.2), on the master id:
+//   byte 0: driver id (FULL 8 bits -- unlike GL II, no status nibble)
+//   byte 1-2: position(16)   byte 3 + byte4[7:4]: velocity(12)
+//   byte4[3:0] + byte 5: torque(12)
+//   byte 6: motor temp (degC, signed)   byte 7: error code (0 = no fault, see mitAkErrorName)
+// NOT YET CHECKED AGAINST A BENCH CAPTURE: the reply id, the temperature offset and the error
+// codes come from the manual only. Pin a real candump frame in test_mit_protocol.cpp before
+// any AK joint runs MIT_CONTROL on hardware.
 
 #include <array>
 #include <cstdint>
@@ -56,6 +65,16 @@ struct MitFeedback {
   int motor_temp{0};    // degC
 };
 
+// Decoded AK feedback frame, in physical units.
+struct MitAkFeedback {
+  uint8_t motor_id{0};  // full CAN id of the driver
+  uint8_t error{0};     // 0 = no fault ... see mitAkErrorName()
+  double position{0.0}; // rad
+  double velocity{0.0}; // rad/s
+  double torque{0.0};   // N.m
+  int motor_temp{0};    // degC
+};
+
 // Manual float_to_uint: clamp to [min,max], then (phys - min) * 2^bits / span, TRUNCATED --
 // bit-identical to the manual's reference implementation and to CubeMars' own tooling, so
 // frames match the worked example in the manual. The result is additionally clamped to
@@ -79,12 +98,20 @@ std::array<uint8_t, 8> packMitCommand(double p, double v, double kp, double kd, 
 // GL II feedback -> physical units. `data` must hold at least 8 bytes.
 MitFeedback decodeGl2Feedback(const uint8_t* data, const MitProfile& profile);
 
+// AK feedback -> physical units. `data` must hold at least 8 bytes.
+MitAkFeedback decodeAkFeedback(const uint8_t* data, const MitProfile& profile);
+
 std::array<uint8_t, 8> mitSpecialFrame(uint8_t code);
 
 const char* mitStatusName(uint8_t status);
 
-// True for the status codes that mean "the drive is healthy" (Disable / Enable).
-bool mitStatusIsOk(uint8_t status);
+// AK error byte: 0 = no fault, 1 = motor over-temp, 2 = over-current, 3 = over-voltage,
+// 4 = under-voltage, 5 = encoder fault, 6 = MOSFET over-temp, 7 = motor lock-up.
+const char* mitAkErrorName(uint8_t error);
+
+// True for the codes that mean "the drive is healthy". The families DISAGREE: on a GL II,
+// 1 is "Enable"; on an AK, 1 is "motor over-temperature". Always pass the motor's family.
+bool mitStatusIsOk(uint8_t status, MitFamily family);
 
 // "ak" / "gl2" (case-sensitive, as written in mit_profiles.yaml). Unknown -> false.
 bool mitFamilyFromString(const std::string& name, MitFamily& out);

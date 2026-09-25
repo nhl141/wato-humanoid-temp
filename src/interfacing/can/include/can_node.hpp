@@ -62,6 +62,8 @@ private:
   // against the gl2 profiles rather than decoded through the DBC.
   int mit_master_id_{0};
   bool handleMitFeedback(const CanMessage& message);
+  void publishAkFeedback(int motor_id, const MitAkFeedback& fb);
+  void publishFeedback(const common_msgs::msg::MotorFeedback& feedback_msg);
   void sendMitSpecialFrame(int motor_id, uint8_t code, const char* what);
 
   // Subscribers and publishers

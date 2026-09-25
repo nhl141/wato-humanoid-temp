@@ -19,7 +19,7 @@ The CSV schema is shared by every source so a single plotter serves them all:
     source     "script" (raw SocketCAN bench tool) or "ros" (joint_command pipeline)
     motor_id   CAN node id
     joint      human name from hardware_mapping.yaml, e.g. shoulder.pitch
-    phase      hold | ramp | settle | monitor | step | stream
+    phase      hold | ramp | settle | monitor | step | stream | dwell | return | rest
     sp_deg     setpoint actually SENT to the motor, degrees (after clamp/rate limiting)
     sp_raw_deg the angle that was REQUESTED before moderation (ros source only)
     pos_deg    measured position, degrees
@@ -288,6 +288,10 @@ def sustained_velocity(t_s, pos_deg, window_s: float = 0.5) -> float:
     return best
 
 
+# Phases that bring a joint back to where the run started (see motor_metrics).
+RETURN_PHASES = ("return", "rest")
+
+
 def motor_metrics(rows, meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Benchmark numbers for one motor's rows. Keys are None when not measurable."""
     meta = meta or {}
@@ -298,15 +302,36 @@ def motor_metrics(rows, meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]
     temps = _finite([r["drive_c"] for r in rows])
 
     meas_vel = _finite(differentiate(t, pos))
-    cmd_vel = _finite(differentiate(t, sp))
+    # A step test jumps the setpoint on purpose (gl40_bench.py: bounded by torque, not by
+    # velocity_max), so the commanded trace is differentiated piecewise, cut where the "step"
+    # phase begins. Every other discontinuity still counts against velocity_max.
+    cuts = [0] + [i for i in range(1, len(rows))
+                  if rows[i].get("phase") == "step" and rows[i - 1].get("phase") != "step"]
+    cmd_vel = []
+    for seg_lo, seg_hi in zip(cuts, cuts[1:] + [len(rows)]):
+        cmd_vel += _finite(differentiate(t[seg_lo:seg_hi], sp[seg_lo:seg_hi]))
+    # The shaft's RESPONSE to a step is as fast as the drive makes it (the bench aborts on shaft
+    # speed instead), so measured velocity is judged on the non-step stretches only.
+    steady_segments, seg_start = [], None
+    for i, r in enumerate(rows + [{"phase": "step"}]):
+        if r.get("phase") != "step" and seg_start is None:
+            seg_start = i
+        elif r.get("phase") == "step" and seg_start is not None:
+            steady_segments.append((seg_start, i))
+            seg_start = None
     limits = meta.get("limits", {}) or {}
 
     m: Dict[str, Any] = {
         "samples": len(rows),
         "duration_s": round(t[-1] - t[0], 3) if len(t) > 1 else 0.0,
         "peak_measured_vel_dps": round(max((abs(v) for v in meas_vel), default=0.0), 2),
-        "sustained_measured_vel_dps": round(sustained_velocity(t, pos), 2),
+        "sustained_measured_vel_dps": round(max(
+            (sustained_velocity(t[lo:hi], pos[lo:hi]) for lo, hi in steady_segments),
+            default=0.0), 2),
         "peak_commanded_vel_dps": round(max((abs(v) for v in cmd_vel), default=0.0), 2),
+        "peak_requested_vel_dps": round(max(
+            (abs(v) for v in _finite(differentiate(t, [r.get("sp_raw_deg") for r in rows]))),
+            default=0.0), 2) or None,
         "peak_torque_nm": round(max((abs(v) for v in tau), default=0.0), 4),
         "peak_drive_temp_c": max(temps, default=None),
         "min_pos_deg": round(min(_finite(pos)), 3) if _finite(pos) else None,
@@ -316,12 +341,33 @@ def motor_metrics(rows, meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]
     # Tracking error, where both traces exist.
     errs = [abs(p - s) for p, s in zip(pos, sp) if p is not None and s is not None]
     m["peak_track_err_deg"] = round(max(errs), 3) if errs else None
-    raw = _finite([r.get("sp_raw_deg") for r in rows])
+    m["final_track_err_deg"] = round(errs[-1], 3) if errs else None
+
+    # Round trips (arm_roundtrip.py, gl40_*.py return-to-start) end back at the start, so the
+    # step shape is measured on the OUTBOUND part only -- up to the first return phase -- and
+    # the way back is scored separately as how close the joint got to where it started.
+    back_i = next((i for i, r in enumerate(rows) if r.get("phase") in RETURN_PHASES), None)
+    # Clamp detection on the outbound part too: at the end of a round trip the request is the
+    # origin again, which would read as "requested 0 -> clamped to <the benchmark angle>".
+    out_rows = rows if back_i is None else rows[:back_i]
+    # A clamp is the pipeline COMMANDING less than was asked (sp_deg short of sp_raw_deg), not the
+    # joint arriving short -- a PD joint sags a degree or so under load without any clamp.
+    raw = _finite([r.get("sp_raw_deg") for r in out_rows])
+    out_sp = _finite([r["sp_deg"] for r in out_rows])
     if raw:
         m["requested_deg"] = round(raw[-1], 3)
-        if m.get("max_pos_deg") is not None and abs(raw[-1] - m["max_pos_deg"]) > 0.5:
-            m["clamped_to_deg"] = round(max(_finite([r["sp_deg"] for r in rows]) or [0]), 3)
-    m["final_track_err_deg"] = round(errs[-1], 3) if errs else None
+        # A run stopped mid-ramp is still lagging its request (low-pass), which is not a clamp.
+        still_ramping = bool(out_rows) and out_rows[-1].get("phase") == "ramp" and back_i is not None
+        if out_sp and abs(raw[-1] - out_sp[-1]) > 0.5 and not still_ramping:
+            m["clamped_to_deg"] = round(out_sp[-1], 3)
+    if back_i is not None:
+        start_sp = next((v for v in sp if v is not None), None)
+        end_pos = next((v for v in reversed(pos) if v is not None), None)
+        if start_sp is not None and end_pos is not None:
+            m["return_err_deg"] = round(end_pos - start_sp, 3)
+        t, pos, sp = t[:back_i], pos[:back_i], sp[:back_i]
+        if _finite(sp):
+            m["benchmark_deg"] = round(_finite(sp)[-1], 3)
 
     # Step-response shape, measured from the first commanded setpoint change.
     start_i = next((i for i in range(1, len(sp))
@@ -372,7 +418,25 @@ def motor_metrics(rows, meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]
               (hi is None or m["max_pos_deg"] <= hi + margin))
         checks.append(("position stayed inside soft limits", ok,
                        f"[{m['min_pos_deg']:.1f}, {m['max_pos_deg']:.1f}] vs {soft} deg"))
-    vel_limit = limits.get("velocity_max_dps") or limits.get("max_setpoint_vel_dps")
+    # ROS runs: the joint's own clamp range from hardware_mapping.yaml (bench runs carry
+    # soft_limits_deg instead, checked above). Commanded must sit inside it exactly -- that IS
+    # the clamp; measured gets 2 deg for PD sag. A joint joint_command never commanded
+    # (excluded: already outside its limits) is not judged on where it happens to rest.
+    joint = next((r.get("joint") for r in rows if r.get("joint")), "")
+    per_joint = (limits.get("per_joint_deg") or {}).get(joint)
+    commanded = _finite([r["sp_deg"] for r in rows])  # the whole run, not the outbound cut
+    if not soft and per_joint and commanded:
+        lo, hi = per_joint
+        checks.append(("commanded stayed inside joint limits",
+                       min(commanded) >= lo - 0.05 and max(commanded) <= hi + 0.05,
+                       f"[{min(commanded):.2f}, {max(commanded):.2f}] vs [{lo:g}, {hi:g}] deg"))
+        if m["min_pos_deg"] is not None:
+            checks.append(("measured stayed inside joint limits (+-2 deg sag)",
+                           m["min_pos_deg"] >= lo - 2.0 and m["max_pos_deg"] <= hi + 2.0,
+                           f"[{m['min_pos_deg']:.2f}, {m['max_pos_deg']:.2f}] vs "
+                           f"[{lo:g}, {hi:g}] deg"))
+    vel_limit = ((limits.get("velocity_max_dps_per_joint") or {}).get(joint)
+                 or limits.get("velocity_max_dps") or limits.get("max_setpoint_vel_dps"))
     if vel_limit is None and limits.get("max_setpoint_vel_rad_s") is not None:
         vel_limit = limits["max_setpoint_vel_rad_s"] * 180.0 / 3.141592653589793
     if vel_limit is not None:
@@ -389,6 +453,10 @@ def motor_metrics(rows, meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]
                        f"{m['sustained_measured_vel_dps']:.2f} / {vel_limit:.1f} deg/s "
                        f"(per-sample peak {m['peak_measured_vel_dps']:.2f} includes "
                        f"sampling jitter)"))
+    if vel_limit is not None and (m["peak_requested_vel_dps"] or 0) > vel_limit * 1.05:
+        # Not a check: it records that this run asked for more than the limit, so the velocity
+        # check above actually tested the limiter rather than a request that was slow anyway.
+        m["velocity_clamp_exercised"] = True
     m["checks"] = [{"name": n, "pass": bool(ok), "detail": d} for n, ok, d in checks]
     m["passed"] = all(c["pass"] for c in m["checks"]) if m["checks"] else None
     return m
@@ -427,10 +495,10 @@ def format_metrics(meta: Dict[str, Any], per_motor: Dict[int, Dict[str, Any]]) -
         lines.append("|---|---|")
         for key in ("samples", "duration_s", "requested_deg", "clamped_to_deg",
                     "sustained_measured_vel_dps", "peak_measured_vel_dps",
-                    "peak_commanded_vel_dps",
+                    "peak_requested_vel_dps", "peak_commanded_vel_dps", "velocity_clamp_exercised",
                     "peak_torque_nm", "peak_track_err_deg", "final_track_err_deg",
-                    "rise_time_s", "overshoot_pct", "settle_time_s", "steady_state_err_deg",
-                    "min_pos_deg", "max_pos_deg", "peak_drive_temp_c"):
+                    "benchmark_deg", "rise_time_s", "overshoot_pct", "settle_time_s",
+                    "steady_state_err_deg", "return_err_deg", "min_pos_deg", "max_pos_deg", "peak_drive_temp_c"):
             if m.get(key) is not None:
                 lines.append(f"| {key} | {m[key]} |")
         if m.get("checks"):

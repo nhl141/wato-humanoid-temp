@@ -19,6 +19,15 @@ struct JointConfig {
   bool limit_range{false};
 };
 
+// Which CubeMars MIT dialect a joint's drive speaks. They disagree about what the status byte
+// means (see can/include/mit_protocol.hpp), so the watchdog has to know.
+enum class MitDriveFamily { Gl2, Ak };
+
+// What a MIT joint does when the node stops trusting its command stream (fault, stale ArmPose,
+// seeding, shutdown). Limp is fine for the unloaded wrist; for a gravity-loaded AK joint it
+// drops the arm, so those default to Damp: kp = 0, kd = mit_fault_kd, and the arm sinks slowly.
+enum class MitFaultAction { Limp, Damp };
+
 struct JointSafetyConfig {
   bool enable_position_clamp{true};
   bool enable_velocity_limit{true};
@@ -46,6 +55,12 @@ struct JointSafetyConfig {
   double mit_max_torque{0.3};       // N.m -- fault above this
   double mit_max_track_err{12.0};   // deg -- fault if the joint lags its setpoint by more
   double mit_feedback_timeout{0.2}; // s without feedback before faulting
+
+  MitDriveFamily mit_family{MitDriveFamily::Gl2};
+  // Default follows the family (ak -> Damp, gl2 -> Limp) unless the YAML sets it explicitly.
+  MitFaultAction mit_fault_action{MitFaultAction::Limp};
+  bool mit_fault_action_explicit{false};
+  double mit_fault_kd{0.0}; // N.m.s/rad, used by Damp; must be > 0 when Damp is in effect
 };
 
 // One motor's latest feedback, as the MIT watchdog needs it. Kept ROS-free so the checks are
@@ -53,7 +68,7 @@ struct JointSafetyConfig {
 struct MotorFeedbackSample {
   double position_deg{0.0}; // MOTOR frame, as published on /interfacing/motorFeedback
   double torque_nm{0.0};
-  int status{0}; // GL II status nibble: 0 = Disable, 1 = Enable, anything else is a fault
+  int status{0}; // GL II: 0 Disable / 1 Enable / else fault. AK: 0 = no fault, else fault.
   double age_s{0.0};
 };
 
@@ -81,19 +96,25 @@ public:
   std::vector<common_msgs::msg::MotorCmd> armPoseToMotorCmds(const common_msgs::msg::ArmPose& pose,
                                                              int8_t default_control_type);
 
-  // Zero-gain MIT frames (kp = kd = 0 -> zero torque whatever the drive's ranges are) for
-  // every MIT joint. Used to poke a GL II drive into answering before seeding -- it only
-  // speaks when spoken to -- and to leave MIT joints limp after a fault or a stale stream.
-  std::vector<common_msgs::msg::MotorCmd> mitIdleCommands() const;
+  // Each MIT joint's fault-action frame: kp = 0 always, so the position field cannot pull the
+  // joint anywhere. Limp joints get kd = 0 (zero torque); Damp joints get kd = mit_fault_kd.
+  // Used to poke drives into answering before seeding (they only speak when spoken to), and
+  // to hold MIT joints safe after a fault or a stale stream. damped_only skips Limp joints.
+  std::vector<common_msgs::msg::MotorCmd> mitSafeCommands(bool damped_only = false) const;
 
   // MIT_ENTER / MIT_EXIT for every MIT joint (a GL II ignores commands until it is entered).
-  std::vector<common_msgs::msg::MotorCmd> mitModeCommands(int8_t control_type) const;
+  // limp_only restricts it to Limp joints -- a Damp joint must keep receiving damping frames,
+  // not be exited, or a gravity-loaded arm drops.
+  std::vector<common_msgs::msg::MotorCmd> mitModeCommands(int8_t control_type,
+                                                          bool limp_only = false) const;
+  bool hasDampedMitJoints() const;
 
   // Seed the rate-limiter's "previous target" from measured motor angles so the first
   // streamed ArmPose is velocity/delta-limited relative to the arm's ACTUAL pose, not an
   // assumed 0. Without this, an arm not physically at 0 gets a large first command (the
   // limiter ramps from 0), i.e. a slam. motor_positions: motor_id -> measured angle (deg,
-  // motor frame). Joints whose motor is ABSENT are left at 0 and reported as unmatched.
+  // motor frame). Joints whose motor is ABSENT are reported as unmatched and excluded from
+  // commands (MIT ones held at kp = 0) until the next seed -- never ramped from an assumed 0.
   SeedReport seedPrevTargetsFromFeedback(const std::map<int, double>& motor_positions);
 
   // Joints whose seeded position is outside their configured limits: the calibration and the
@@ -147,12 +168,14 @@ private:
   static double clampStep(double target, double previous, double delta_max);
   static double applyLowPass(double target, double previous, double alpha);
   bool validateMitGains();
+  common_msgs::msg::MotorCmd mitSafeCommand(size_t joint) const;
 
   std::vector<JointConfig> joints_;
   std::vector<JointSafetyConfig> safety_;
   std::vector<double> prev_targets_;
   std::vector<double> last_motor_cmd_deg_;
   std::vector<bool> blocked_;
+  std::vector<bool> unpowered_; // no feedback at the last seed; recomputed every seed
   bool have_prev_targets_{false};
   double control_rate_hz_{50.0};
   std::string last_error_;

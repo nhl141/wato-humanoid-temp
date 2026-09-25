@@ -30,6 +30,20 @@ MitProfile gl40Profile() {
   return p;
 }
 
+// AK80-9 as configured in config/mit_profiles.yaml (ids 10, 11, 13).
+MitProfile ak809Profile() {
+  MitProfile p;
+  p.p_min = -12.56;
+  p.p_max = 12.56;
+  p.v_min = -65.0;
+  p.v_max = 65.0;
+  p.t_min = -18.0;
+  p.t_max = 18.0;
+  p.family = MitFamily::Ak;
+  p.model = "AK80-9";
+  return p;
+}
+
 } // namespace
 
 // GL II manual section 5.5 "MIT position" worked example: p_des 2 rad, kp 0.123, kd 0.005
@@ -84,7 +98,7 @@ TEST(MitDecode, DecodesBenchFeedbackCapture) {
 
   EXPECT_EQ(fb.id_nibble, 0x6);
   EXPECT_EQ(fb.status, 0x1);
-  EXPECT_TRUE(mitStatusIsOk(fb.status));
+  EXPECT_TRUE(mitStatusIsOk(fb.status, MitFamily::Gl2));
   EXPECT_STREQ(mitStatusName(fb.status), "Enable");
   EXPECT_NEAR(fb.position, 2.454, 0.002);
   EXPECT_NEAR(fb.velocity, 0.0, 0.2);
@@ -97,8 +111,46 @@ TEST(MitDecode, ReportsFaultStatuses) {
   uint8_t data[8] = {0xA6, 0x99, 0x21, 0x7F, 0xE7, 0xFF, 0x28, 0x00}; // 0xA = over-current
   const auto fb = decodeGl2Feedback(data, gl40Profile());
   EXPECT_EQ(fb.status, 0xA);
-  EXPECT_FALSE(mitStatusIsOk(fb.status));
+  EXPECT_FALSE(mitStatusIsOk(fb.status, MitFamily::Gl2));
   EXPECT_STREQ(mitStatusName(fb.status), "Over-current");
+}
+
+// SYNTHETIC frame built from the AK manual's layout -- NOT a bench capture. Replace with a real
+// candump of an AK in MIT mode before any AK joint runs MIT_CONTROL on hardware.
+TEST(MitDecode, DecodesAkLayoutFromTheManual) {
+  const auto p = ak809Profile();
+  const uint32_t pos_i = packMitValue(1.25, p.p_min, p.p_max, 16);
+  const uint32_t vel_i = packMitValue(-0.5, p.v_min, p.v_max, 12);
+  const uint32_t t_i = packMitValue(3.0, p.t_min, p.t_max, 12);
+  const uint8_t data[8] = {
+      13,
+      static_cast<uint8_t>(pos_i >> 8),
+      static_cast<uint8_t>(pos_i & 0xFF),
+      static_cast<uint8_t>(vel_i >> 4),
+      static_cast<uint8_t>(((vel_i & 0xF) << 4) | (t_i >> 8)),
+      static_cast<uint8_t>(t_i & 0xFF),
+      35,
+      0,
+  };
+  const auto fb = decodeAkFeedback(data, p);
+  EXPECT_EQ(fb.motor_id, 13);
+  EXPECT_NEAR(fb.position, 1.25, 25.12 / 65535.0);
+  EXPECT_NEAR(fb.velocity, -0.5, 130.0 / 4095.0);
+  EXPECT_NEAR(fb.torque, 3.0, 36.0 / 4095.0);
+  EXPECT_EQ(fb.motor_temp, 35);
+  EXPECT_EQ(fb.error, 0);
+  EXPECT_TRUE(mitStatusIsOk(fb.error, MitFamily::Ak));
+}
+
+// The two families disagree about code 1: GL II "Enable" (healthy), AK "motor over-temp".
+// Reading AK feedback with the GL II rule would wave an overheating shoulder through.
+TEST(MitDecode, StatusOneIsAFaultOnAkButHealthyOnGl2) {
+  EXPECT_TRUE(mitStatusIsOk(1, MitFamily::Gl2));
+  EXPECT_FALSE(mitStatusIsOk(1, MitFamily::Ak));
+  EXPECT_STREQ(mitAkErrorName(1), "Motor over-temperature");
+  for (uint8_t e = 1; e <= 7; ++e) {
+    EXPECT_FALSE(mitStatusIsOk(e, MitFamily::Ak)) << "AK error " << static_cast<int>(e);
+  }
 }
 
 TEST(MitPacking, RoundTripsWithinOneCount) {

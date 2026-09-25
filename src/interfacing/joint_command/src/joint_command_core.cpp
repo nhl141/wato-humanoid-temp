@@ -77,6 +77,7 @@ bool JointCommandCore::loadFromYaml(const YAML::Node& config, const std::string&
   prev_targets_.assign(joints_.size(), 0.0);
   last_motor_cmd_deg_.assign(joints_.size(), 0.0);
   blocked_.assign(joints_.size(), false);
+  unpowered_.assign(joints_.size(), false);
   have_prev_targets_ = true;
   return true;
 }
@@ -85,13 +86,17 @@ SeedReport
 JointCommandCore::seedPrevTargetsFromFeedback(const std::map<int, double>& motor_positions) {
   SeedReport report;
   std::vector<double> seeded(joints_.size(), 0.0);
+  unpowered_.assign(joints_.size(), false);
   if (last_motor_cmd_deg_.size() != joints_.size()) {
     last_motor_cmd_deg_.assign(joints_.size(), 0.0);
   }
   for (size_t i = 0; i < joints_.size(); ++i) {
     const auto it = motor_positions.find(static_cast<int>(joints_[i].motor_id));
     if (it == motor_positions.end()) {
-      report.unmatched.push_back(i); // motor not reporting (e.g. unwired) -> leave at 0
+      // Not reporting (unpowered / unwired): exclude it rather than ramp it from an assumed 0,
+      // which a drive powered on mid-session would jump to.
+      report.unmatched.push_back(i);
+      unpowered_[i] = true;
       continue;
     }
     // Inverse of applyCalibration (motor = direction * (cmd - zero_offset)):
@@ -130,7 +135,8 @@ void JointCommandCore::blockJoints(const std::vector<size_t>& indices) {
 }
 
 bool JointCommandCore::isBlocked(size_t joint) const {
-  return joint < blocked_.size() && blocked_[joint];
+  return (joint < blocked_.size() && blocked_[joint]) ||
+         (joint < unpowered_.size() && unpowered_[joint]);
 }
 
 double JointCommandCore::clampAngle(double angle, const JointConfig& joint) {
@@ -201,6 +207,34 @@ JointSafetyConfig JointCommandCore::loadJointSafetyConfig(const YAML::Node& join
   if (joint_node["mit_feedback_timeout"]) {
     cfg.mit_feedback_timeout = joint_node["mit_feedback_timeout"].as<double>();
   }
+  if (joint_node["mit_family"]) {
+    const std::string family = joint_node["mit_family"].as<std::string>();
+    if (family == "gl2") {
+      cfg.mit_family = MitDriveFamily::Gl2;
+    } else if (family == "ak") {
+      cfg.mit_family = MitDriveFamily::Ak;
+    } else {
+      throw std::runtime_error("mit_family must be 'ak' or 'gl2', got '" + family + "'");
+    }
+  }
+  if (joint_node["mit_fault_action"]) {
+    const std::string action = joint_node["mit_fault_action"].as<std::string>();
+    if (action == "limp") {
+      cfg.mit_fault_action = MitFaultAction::Limp;
+    } else if (action == "damp") {
+      cfg.mit_fault_action = MitFaultAction::Damp;
+    } else {
+      throw std::runtime_error("mit_fault_action must be 'limp' or 'damp', got '" + action + "'");
+    }
+    cfg.mit_fault_action_explicit = true;
+  }
+  if (!cfg.mit_fault_action_explicit) {
+    cfg.mit_fault_action =
+        cfg.mit_family == MitDriveFamily::Ak ? MitFaultAction::Damp : MitFaultAction::Limp;
+  }
+  if (joint_node["mit_fault_kd"]) {
+    cfg.mit_fault_kd = joint_node["mit_fault_kd"].as<double>();
+  }
   return cfg;
 }
 
@@ -231,6 +265,13 @@ bool JointCommandCore::validateMitGains() {
              << s.mit_max_track_err << " deg = " << worst << " N.m exceeds mit_max_torque "
              << s.mit_max_torque << " N.m -- lower mit_kp or mit_max_track_err";
     }
+    // Damp must actually damp: kd = 0 would be Limp under another name, and above the 12-bit
+    // field's 5.0 ceiling it would be clamped to something other than what was configured.
+    if (s.mit_fault_action == MitFaultAction::Damp &&
+        (s.mit_fault_kd <= 0.0 || s.mit_fault_kd > 5.0)) {
+      errors << "\n  " << name << ": mit_fault_action is damp, so mit_fault_kd must be in "
+             << "(0, 5] N.m.s/rad (got " << s.mit_fault_kd << ")";
+    }
   }
   const std::string text = errors.str();
   if (!text.empty()) {
@@ -252,16 +293,23 @@ bool JointCommandCore::loadSafetyFromYaml(const YAML::Node& safety_cfg, double c
   }
 
   control_rate_hz_ = control_rate_hz;
-  JointSafetyConfig defaults;
-  if (safety_cfg["global"]) {
-    defaults = loadJointSafetyConfig(safety_cfg["global"], defaults);
-  }
+  try {
+    JointSafetyConfig defaults;
+    if (safety_cfg["global"]) {
+      defaults = loadJointSafetyConfig(safety_cfg["global"], defaults);
+    }
+    // mit_fault_action_explicit is inherited too, so a joint that only sets mit_family: ak
+    // re-derives Damp instead of keeping the Limp the global block derived for gl2.
 
-  safety_.assign(joints_.size(), defaults);
-  for (size_t i = 0; i < jointPaths().size(); ++i) {
-    const auto& [group, joint_name] = jointPaths()[i];
-    const YAML::Node joint_node = safety_cfg["joints"][group][joint_name];
-    safety_[i] = loadJointSafetyConfig(joint_node, defaults);
+    safety_.assign(joints_.size(), defaults);
+    for (size_t i = 0; i < jointPaths().size(); ++i) {
+      const auto& [group, joint_name] = jointPaths()[i];
+      const YAML::Node joint_node = safety_cfg["joints"][group][joint_name];
+      safety_[i] = loadJointSafetyConfig(joint_node, defaults);
+    }
+  } catch (const std::exception& e) {
+    last_error_ = e.what();
+    return false;
   }
   return validateMitGains();
 }
@@ -300,32 +348,39 @@ std::string JointCommandCore::jointName(size_t joint) const {
   return jointPaths()[joint].first + "." + jointPaths()[joint].second;
 }
 
-std::vector<common_msgs::msg::MotorCmd> JointCommandCore::mitIdleCommands() const {
+common_msgs::msg::MotorCmd JointCommandCore::mitSafeCommand(size_t joint) const {
+  common_msgs::msg::MotorCmd cmd;
+  cmd.motor_id = joints_[joint].motor_id;
+  cmd.control_type = common_msgs::msg::MotorCmd::MIT_CONTROL;
+  // kp = t_ff = 0: the position field cannot pull the joint anywhere, whatever the drive's
+  // ranges are. Limp adds kd = 0 (zero torque); Damp only resists motion, so a gravity-loaded
+  // joint sinks at a speed set by mit_fault_kd instead of free-falling.
+  cmd.position = 0.0f;
+  cmd.velocity = 0.0f;
+  cmd.torque = 0.0f;
+  cmd.kp = 0.0f;
+  cmd.kd = safety_[joint].mit_fault_action == MitFaultAction::Damp
+               ? static_cast<float>(safety_[joint].mit_fault_kd)
+               : 0.0f;
+  return cmd;
+}
+
+std::vector<common_msgs::msg::MotorCmd> JointCommandCore::mitSafeCommands(bool damped_only) const {
   std::vector<common_msgs::msg::MotorCmd> cmds;
   for (size_t i = 0; i < joints_.size(); ++i) {
-    if (!isMitJoint(i)) {
+    if (!isMitJoint(i) || (damped_only && safety_[i].mit_fault_action != MitFaultAction::Damp)) {
       continue;
     }
-    common_msgs::msg::MotorCmd cmd;
-    cmd.motor_id = joints_[i].motor_id;
-    cmd.control_type = common_msgs::msg::MotorCmd::MIT_CONTROL;
-    // kp = kd = t_ff = 0 -> torque is 0 whatever the drive's ranges are, so the position
-    // field cannot move anything. This is the safe way to make a GL II answer.
-    cmd.position = 0.0f;
-    cmd.velocity = 0.0f;
-    cmd.torque = 0.0f;
-    cmd.kp = 0.0f;
-    cmd.kd = 0.0f;
-    cmds.push_back(cmd);
+    cmds.push_back(mitSafeCommand(i));
   }
   return cmds;
 }
 
-std::vector<common_msgs::msg::MotorCmd>
-JointCommandCore::mitModeCommands(int8_t control_type) const {
+std::vector<common_msgs::msg::MotorCmd> JointCommandCore::mitModeCommands(int8_t control_type,
+                                                                          bool limp_only) const {
   std::vector<common_msgs::msg::MotorCmd> cmds;
   for (size_t i = 0; i < joints_.size(); ++i) {
-    if (!isMitJoint(i)) {
+    if (!isMitJoint(i) || (limp_only && safety_[i].mit_fault_action != MitFaultAction::Limp)) {
       continue;
     }
     common_msgs::msg::MotorCmd cmd;
@@ -334,6 +389,15 @@ JointCommandCore::mitModeCommands(int8_t control_type) const {
     cmds.push_back(cmd);
   }
   return cmds;
+}
+
+bool JointCommandCore::hasDampedMitJoints() const {
+  for (size_t i = 0; i < joints_.size(); ++i) {
+    if (isMitJoint(i) && safety_[i].mit_fault_action == MitFaultAction::Damp) {
+      return true;
+    }
+  }
+  return false;
 }
 
 std::optional<std::string>
@@ -357,10 +421,13 @@ JointCommandCore::checkMitFaults(const std::map<int, MotorFeedbackSample>& feedb
          << " s)";
       return os.str();
     }
-    // GL II status nibble: 0 = Disable, 1 = Enable. Anything else is a drive fault
-    // (over-voltage / over-current / over-temperature / comms loss / overload).
-    if (fb.status != 0 && fb.status != 1) {
-      return name + ": drive reports fault status " + std::to_string(fb.status);
+    // GL II status nibble: 0 = Disable, 1 = Enable, anything else is a drive fault. AK error
+    // byte: 0 = no fault, and 1 is MOTOR OVER-TEMPERATURE -- the GL II rule would pass it.
+    const bool status_ok =
+        s.mit_family == MitDriveFamily::Ak ? fb.status == 0 : (fb.status == 0 || fb.status == 1);
+    if (!status_ok) {
+      return name + ": drive reports fault status " + std::to_string(fb.status) +
+             (s.mit_family == MitDriveFamily::Ak ? " (AK error code)" : " (GL II status)");
     }
     if (std::abs(fb.torque_nm) > s.mit_max_torque) {
       std::ostringstream os;
@@ -417,15 +484,11 @@ JointCommandCore::armPoseToMotorCmds(const common_msgs::msg::ArmPose& pose,
     const JointSafetyConfig& safety = safety_[i];
 
     if (isBlocked(i)) {
-      // Calibration and hardware disagree about where this joint can be. MIT joints go limp
-      // (zero gains); servo joints get no command at all, so the drive holds its last target.
+      // Unpowered, or calibration and hardware disagree about where it can be. MIT joints get
+      // their fault action (limp or damp, never stiff); servo joints get no command at all, so
+      // the drive holds its last target.
       if (isMitJoint(i)) {
-        common_msgs::msg::MotorCmd cmd;
-        cmd.motor_id = joints_[i].motor_id;
-        cmd.control_type = common_msgs::msg::MotorCmd::MIT_CONTROL;
-        cmd.kp = 0.0f;
-        cmd.kd = 0.0f;
-        commands.push_back(cmd);
+        commands.push_back(mitSafeCommand(i));
       }
       continue;
     }

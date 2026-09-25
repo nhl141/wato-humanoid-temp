@@ -74,6 +74,23 @@ MitFeedback decodeGl2Feedback(const uint8_t* data, const MitProfile& profile) {
   return fb;
 }
 
+MitAkFeedback decodeAkFeedback(const uint8_t* data, const MitProfile& profile) {
+  MitAkFeedback fb;
+  if (data == nullptr) {
+    return fb;
+  }
+  fb.motor_id = data[0];
+  const uint32_t pos_i = (static_cast<uint32_t>(data[1]) << 8) | data[2];
+  const uint32_t vel_i = (static_cast<uint32_t>(data[3]) << 4) | (data[4] >> 4);
+  const uint32_t t_i = (static_cast<uint32_t>(data[4] & 0xF) << 8) | data[5];
+  fb.position = unpackMitValue(pos_i, profile.p_min, profile.p_max, 16);
+  fb.velocity = unpackMitValue(vel_i, profile.v_min, profile.v_max, 12);
+  fb.torque = unpackMitValue(t_i, profile.t_min, profile.t_max, 12);
+  fb.motor_temp = static_cast<int8_t>(data[6]);
+  fb.error = data[7];
+  return fb;
+}
+
 std::array<uint8_t, 8> mitSpecialFrame(uint8_t code) {
   return {{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, code}};
 }
@@ -103,7 +120,33 @@ const char* mitStatusName(uint8_t status) {
   }
 }
 
-bool mitStatusIsOk(uint8_t status) {
+const char* mitAkErrorName(uint8_t error) {
+  switch (error) {
+  case 0:
+    return "No fault";
+  case 1:
+    return "Motor over-temperature";
+  case 2:
+    return "Over-current";
+  case 3:
+    return "Over-voltage";
+  case 4:
+    return "Under-voltage";
+  case 5:
+    return "Encoder fault";
+  case 6:
+    return "MOSFET over-temperature";
+  case 7:
+    return "Motor lock-up";
+  default:
+    return "Unknown";
+  }
+}
+
+bool mitStatusIsOk(uint8_t status, MitFamily family) {
+  if (family == MitFamily::Ak) {
+    return status == 0;
+  }
   return status == 0x0 || status == 0x1;
 }
 

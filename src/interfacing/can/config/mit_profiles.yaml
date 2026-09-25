@@ -9,9 +9,11 @@
 # every position sent to it is wrong by the ratio of the ranges.
 #
 # family: selects the frame/feedback dialect can_node speaks to this motor.
-#   ak  -- AK-series (AK10-9 / AK80-9), manual V3.2.0 section 4.2. MIT command frames are
-#          accepted; MIT *feedback* decoding is NOT implemented (these motors run POSITION_LOOP
-#          and report through ServoStatusFeedback instead).
+#   ak  -- AK-series (AK10-9 / AK80-9), manual V3.2.0 section 4.2. Standard 11-bit frames;
+#          feedback on the master id with the FULL motor id in byte 0, decoded by
+#          decodeAkFeedback(). That layout is from the manual and has NOT been checked against
+#          a bench capture yet -- see can/README.md "AK joints in MIT mode" before switching
+#          any AK joint to MIT_CONTROL. The drive must also be put in MIT mode (upper computer).
 #   gl2 -- GL II gimbal drive (GL40 KV70), manual V1.0 section 5. Standard 11-bit frames,
 #          feedback on the master id (mit_master_id, default 0x000), decoded by
 #          decodeGl2Feedback(). Needs MIT_ENTER before it accepts commands.

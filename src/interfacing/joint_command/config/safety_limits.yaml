@@ -39,28 +39,75 @@ safety:
     mit_max_torque: 0.3
     mit_max_track_err: 12.0
     mit_feedback_timeout: 0.2
+    # Which MIT dialect the drive speaks: gl2 (GL40) or ak (AK10-9 / AK80-9). They disagree
+    # about the status byte -- on an AK, 1 means MOTOR OVER-TEMPERATURE, not "Enable".
+    mit_family: gl2
+    # What a MIT joint does on a fault / stale stream / seeding / shutdown. Default follows
+    # mit_family: gl2 -> limp (kp = kd = 0, then MIT_EXIT); ak -> damp (kp = 0,
+    # kd = mit_fault_kd, streamed so the drive's CAN timeout doesn't cut output) -- a limp
+    # shoulder drops the arm. damp requires 0 < mit_fault_kd <= 5.
+    mit_fault_kd: 0.0
 
   joints:
     # --- AK10-9 / AK80-9, servo POSITION_LOOP ------------------------------
     # Limits come from calibrate_arm.py's software zero-mode (see hardware_mapping.yaml).
     # Re-run calibration after any power cycle: AK80-9 joints lose their zero (ARM_BRINGUP.md).
+    #
+    # MIT on these joints: the commented blocks are STARTING gains, not validated ones. Do NOT
+    # uncomment one until can/README.md "AK joints in MIT mode" is done for that joint (drive
+    # in MIT mode, feedback layout pinned from a bench capture, zero checked in the MIT frame,
+    # arm supported). One joint at a time: elbow roll, elbow pitch, shoulder yaw, shoulder
+    # roll, shoulder pitch. Ceilings (real-hardware-safety skill): AK10-9 10 N.m, AK80-9 5 N.m.
+    # Gain rule: quantised kp * 12 deg (0.2094 rad) <= mit_max_torque.
+    # Pure PD sags under gravity by ~tau_grav / kp; if that exceeds mit_max_track_err the
+    # watchdog faults -- expect that on the shoulders until gravity feed-forward exists.
     shoulder:
-      pitch:
+      pitch:   # AK10-9, id 14 -- most gravity load, bring up LAST
+        velocity_max: 30.0
+        delta_max: 2.0
+        # control_type: 0
+        # mit_family: ak
+        # mit_kp: 15.0           # -> 15.01 applied; x 0.2094 rad = 3.14 N.m <= 10
+        # mit_kd: 0.8
+        # mit_max_torque: 10.0
+        # mit_fault_kd: 1.0
+      roll:    # AK10-9, id 12
         velocity_max: 10.0
         delta_max: 2.0
-      roll:
+        # control_type: 0
+        # mit_family: ak
+        # mit_kp: 15.0
+        # mit_kd: 0.8
+        # mit_max_torque: 10.0
+        # mit_fault_kd: 1.0
+      yaw:     # AK80-9, id 11
         velocity_max: 10.0
         delta_max: 2.0
-      yaw:
-        velocity_max: 10.0
-        delta_max: 2.0
+        # control_type: 0
+        # mit_family: ak
+        # mit_kp: 8.0            # -> 8.06 applied; x 0.2094 rad = 1.69 N.m <= 5
+        # mit_kd: 0.4
+        # mit_max_torque: 5.0
+        # mit_fault_kd: 0.5
     elbow:
-      pitch:
+      pitch:   # AK80-9, id 10
         velocity_max: 10.0
         delta_max: 1.6
-      roll:
+        # control_type: 0
+        # mit_family: ak
+        # mit_kp: 8.0
+        # mit_kd: 0.4
+        # mit_max_torque: 5.0
+        # mit_fault_kd: 0.5
+      roll:    # AK80-9, id 13 -- least gravity load, bring up FIRST
         velocity_max: 10.0
         delta_max: 1.6
+        # control_type: 0
+        # mit_family: ak
+        # mit_kp: 8.0
+        # mit_kd: 0.4
+        # mit_max_torque: 5.0
+        # mit_fault_kd: 0.5
 
     # --- GL40 KV70 on a GL II drive, MIT_CONTROL ---------------------------
     # This joint is a PD drive: the motor applies
@@ -85,6 +132,7 @@ safety:
     wrist:
       pitch:
         control_type: 0        # MIT_CONTROL
+        mit_family: gl2        # fault action defaults to limp: unloaded, safe to free
         velocity_max: 10.0
         delta_max: 2.4
         mit_kp: 1.22           # N.m/rad  -> raw 10 -> 1.2207 applied

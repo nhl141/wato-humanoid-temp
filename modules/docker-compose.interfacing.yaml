@@ -68,4 +68,8 @@ services:
       - ${MONO_DIR}/src/interfacing/can/scripts:/opt/humanoid_scripts:ro
       - ${MONO_DIR}/src/interfacing/joint_command/config/hardware_mapping.yaml:/calibration/hardware_mapping.yaml:ro
       - ${MONO_DIR}/src/interfacing/joint_command/config:/opt/joint_command_config:ro
+      # joint_command_node loads its INSTALLED share/config, which the image bakes in at build
+      # time. Overlay the repo copy so a calibrate_arm.py run (or a limits edit) takes effect on
+      # the next node restart instead of silently needing an image rebuild.
+      - ${MONO_DIR}/src/interfacing/joint_command/config:/opt/watonomous/joint_command/share/joint_command/config:ro
       - ${MONO_DIR}/outputs:/outputs

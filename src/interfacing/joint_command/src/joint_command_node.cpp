@@ -1,10 +1,12 @@
 #include "joint_command_node.hpp"
 
+#include <algorithm>
 #include <ament_index_cpp/get_package_share_directory.hpp>
 #include <chrono>
 #include <functional>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <yaml-cpp/yaml.h>
 
 JointCommandNode::JointCommandNode() : Node("joint_command_node") {
@@ -15,6 +17,7 @@ JointCommandNode::JointCommandNode() : Node("joint_command_node") {
   this->declare_parameter("control_type", common_msgs::msg::MotorCmd::POSITION_LOOP);
   this->declare_parameter("feedback_topic", "/interfacing/motorFeedback");
   this->declare_parameter("command_timeout_sec", 10.0);
+  this->declare_parameter("mit_shutdown_damp_sec", 2.0);
 
   const std::string arm_side = this->get_parameter("arm_side").as_string();
   control_rate_hz_ = this->get_parameter("control_rate_hz").as_double();
@@ -23,6 +26,7 @@ JointCommandNode::JointCommandNode() : Node("joint_command_node") {
   control_type_ = static_cast<int8_t>(this->get_parameter("control_type").as_int());
   const std::string feedback_topic = this->get_parameter("feedback_topic").as_string();
   command_timeout_sec_ = this->get_parameter("command_timeout_sec").as_double();
+  mit_shutdown_damp_sec_ = this->get_parameter("mit_shutdown_damp_sec").as_double();
 
   const YAML::Node hardware_config =
       YAML::LoadFile(ament_index_cpp::get_package_share_directory("joint_command") +
@@ -111,7 +115,18 @@ std::map<int, MotorFeedbackSample> JointCommandNode::mitFeedbackSamples() {
 }
 
 bool JointCommandNode::trySeedFromFeedback() {
-  if (latest_feedback_.empty()) {
+  // Seed only from motors reporting NOW: latest_feedback_ keeps the last angle of a motor that
+  // has since been powered off, and seeding from it would treat that joint as live.
+  constexpr double kSeedFeedbackMaxAgeS = 0.5;
+  const rclcpp::Time now = this->get_clock()->now();
+  std::map<int, double> fresh;
+  for (const auto& [id, pos] : latest_feedback_) {
+    const auto it = latest_feedback_time_.find(id);
+    if (it != latest_feedback_time_.end() && (now - it->second).seconds() < kSeedFeedbackMaxAgeS) {
+      fresh[id] = pos;
+    }
+  }
+  if (fresh.empty()) {
     RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
                          "Waiting for motor feedback before accepting ArmPose: the "
                          "rate-limiter must be seeded from the real pose first. No command "
@@ -119,21 +134,9 @@ bool JointCommandNode::trySeedFromFeedback() {
     return false;
   }
 
-  // Every MIT joint must be seeded from REAL feedback. Seeding one to 0 would make the PD
-  // controller pull the joint toward a position it has never been told about.
-  for (size_t i = 0; i < core_.jointCount(); ++i) {
-    if (core_.isMitJoint(i) &&
-        latest_feedback_.find(static_cast<int>(core_.motorId(i))) == latest_feedback_.end()) {
-      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-                           "MIT joint %s (motor %d) has no feedback yet -- refusing to command "
-                           "any joint. A MIT joint seeded to an assumed 0 would be pulled there "
-                           "by its own stiffness.",
-                           core_.jointName(i).c_str(), static_cast<int>(core_.motorId(i)));
-      return false;
-    }
-  }
-
-  const SeedReport report = core_.seedPrevTargetsFromFeedback(latest_feedback_);
+  // Joints with no fresh feedback (MIT included) are excluded by the seed: never commanded
+  // toward an assumed 0, MIT ones held at kp = 0.
+  const SeedReport report = core_.seedPrevTargetsFromFeedback(fresh);
   seeded_from_feedback_ = true;
 
   const auto& seeded = core_.prevTargets();
@@ -145,6 +148,14 @@ bool JointCommandNode::trySeedFromFeedback() {
               "Rate-limiter seeded from feedback: %s. prev_targets(cmd-frame deg)=[%s]. Now "
               "accepting ArmPose; motion ramps from here.",
               report.describe().c_str(), s.c_str());
+
+  for (const size_t i : report.unmatched) {
+    RCLCPP_WARN(this->get_logger(),
+                "EXCLUDING joint %s (motor %d): no feedback -- not commanded%s until the next "
+                "seed (after the ArmPose stream goes stale).",
+                core_.jointName(i).c_str(), static_cast<int>(core_.motorId(i)),
+                core_.isMitJoint(i) ? " (MIT: held at kp=0)" : "");
+  }
 
   if (!report.out_of_range.empty()) {
     // The joint is physically outside the limits its own config allows. Clamping it would
@@ -170,14 +181,18 @@ void JointCommandNode::mitFault(const std::string& reason) {
   }
   mit_faulted_ = true;
   RCLCPP_ERROR(this->get_logger(),
-               "MIT FAULT: %s. Freeing all MIT joints and halting commands. Restart the node "
+               "MIT FAULT: %s. Limp MIT joints are freed, damped ones are held at kp=0 "
+               "(sinking slowly) while this node runs; commands are halted. Restart the node "
                "after checking the hardware.",
                reason.c_str());
-  freeMitJoints();
+  exitMitJoints(/*limp_only=*/true);
+  for (const auto& cmd : core_.mitSafeCommands(/*damped_only=*/true)) {
+    motor_cmd_pub_->publish(cmd);
+  }
 }
 
-void JointCommandNode::freeMitJoints() {
-  const auto cmds = core_.mitModeCommands(common_msgs::msg::MotorCmd::MIT_EXIT);
+void JointCommandNode::exitMitJoints(bool limp_only) {
+  const auto cmds = core_.mitModeCommands(common_msgs::msg::MotorCmd::MIT_EXIT, limp_only);
   if (cmds.empty() || !motor_cmd_pub_) {
     return;
   }
@@ -189,17 +204,64 @@ void JointCommandNode::freeMitJoints() {
   }
 }
 
+void JointCommandNode::shutdownMitJoints() {
+  if (core_.mitMotorIds().empty() || !motor_cmd_pub_) {
+    return;
+  }
+  // Damped joints (gravity-loaded AK) first sink under damping for mit_shutdown_damp_sec, so
+  // the final EXIT does not drop the arm from wherever it was. Only as good as can_node still
+  // being alive to forward these -- stop joint_command BEFORE can_node, with the arm supported.
+  if (core_.hasDampedMitJoints() && mit_shutdown_damp_sec_ > 0.0) {
+    RCLCPP_WARN(this->get_logger(), "Shutdown: damping MIT joints for %.1f s before exiting",
+                mit_shutdown_damp_sec_);
+    const auto period = std::chrono::duration<double>(1.0 / control_rate_hz_);
+    const auto end = std::chrono::steady_clock::now() +
+                     std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                         std::chrono::duration<double>(mit_shutdown_damp_sec_));
+    const auto damp = core_.mitSafeCommands(/*damped_only=*/true);
+    while (std::chrono::steady_clock::now() < end) {
+      for (const auto& cmd : damp) {
+        motor_cmd_pub_->publish(cmd);
+      }
+      std::this_thread::sleep_for(period);
+    }
+  }
+  exitMitJoints(/*limp_only=*/false);
+}
+
 void JointCommandNode::controlTimerCallback() {
   if (mit_faulted_) {
+    // Keep streaming damping to Damp joints: an AK whose command stream stops trips its own
+    // CAN timeout and cuts output -- which drops a loaded arm just like going limp would.
+    for (const auto& cmd : core_.mitSafeCommands(/*damped_only=*/true)) {
+      motor_cmd_pub_->publish(cmd);
+    }
     return;
   }
 
-  // Poke the MIT drives even before seeding: a GL II only answers when spoken to, so without
-  // this there would be no feedback to seed FROM. Zero gains means zero torque.
+  // Poke the MIT drives even before seeding: they only answer when spoken to, so without this
+  // there would be no feedback to seed FROM. kp = 0, so nothing is pulled anywhere (Limp
+  // joints get zero torque, Damp joints only resist motion).
   if (!seeded_from_feedback_) {
-    for (const auto& cmd : core_.mitIdleCommands()) {
+    // The constructor's MIT_ENTER is sent before DDS has matched can_node, so it can be lost
+    // -- and a drive that never entered silently ignores every gain it is later sent (seen in
+    // gl40_sim: a 5 deg move that never moved, too small to trip the tracking watchdog). Keep
+    // re-entering while unseeded; the gains are zero here, so entering commands no torque.
+    // Also covers a drive power-cycled while this node is up. Every 0.5 s for the first 5 s
+    // (the startup race), then every 5 s so an idle node doesn't flood can_node's log.
+    const int startup_ticks = static_cast<int>(control_rate_hz_ * 5.0);
+    const int enter_every = std::max(
+        1, static_cast<int>(control_rate_hz_ * (unseeded_ticks_ < startup_ticks ? 0.5 : 5.0)));
+    if (unseeded_ticks_++ % enter_every == 0) {
+      for (const auto& cmd : core_.mitModeCommands(common_msgs::msg::MotorCmd::MIT_ENTER)) {
+        motor_cmd_pub_->publish(cmd);
+      }
+    }
+    for (const auto& cmd : core_.mitSafeCommands()) {
       motor_cmd_pub_->publish(cmd);
     }
+  } else {
+    unseeded_ticks_ = 0;
   }
 
   if (!have_latest_pose_) {
@@ -214,11 +276,11 @@ void JointCommandNode::controlTimerCallback() {
     RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
                          "ArmPose stream stale (no message in %.1fs): halting motor commands "
                          "until a fresh ArmPose re-seeds the rate-limiter. MIT joints are held "
-                         "limp.",
+                         "at kp=0 (limp or damped, per mit_fault_action).",
                          command_timeout_sec_);
     have_latest_pose_ = false;
     seeded_from_feedback_ = false;
-    for (const auto& cmd : core_.mitIdleCommands()) {
+    for (const auto& cmd : core_.mitSafeCommands()) {
       motor_cmd_pub_->publish(cmd);
     }
     return;
@@ -268,10 +330,17 @@ void JointCommandNode::publishMotorCommands(const std::vector<common_msgs::msg::
 int main(int argc, char** argv) {
   rclcpp::init(argc, argv);
   auto node = std::make_shared<JointCommandNode>();
+  // Ctrl-C: leave MIT joints safe rather than holding their last target with nothing left alive
+  // to watch them. This MUST run pre-shutdown: once rclcpp::spin returns the context is already
+  // invalid and publish() silently drops every message (rclcpp Publisher::publish returns early
+  // on an invalid context) -- so the post-spin call this replaces never reached the bus.
+  std::weak_ptr<JointCommandNode> weak = node;
+  rclcpp::contexts::get_global_default_context()->add_pre_shutdown_callback([weak]() {
+    if (auto n = weak.lock()) {
+      n->shutdownMitJoints();
+    }
+  });
   rclcpp::spin(node);
-  // Ctrl-C lands here: leave the GL40s limp rather than holding their last MIT target with
-  // nothing left alive to watch them.
-  node->freeMitJoints();
   rclcpp::shutdown();
   return 0;
 }

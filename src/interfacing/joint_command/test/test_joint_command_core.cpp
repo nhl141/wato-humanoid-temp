@@ -238,6 +238,38 @@ TEST_F(ShippedConfig, MotorsWithoutFeedbackAreReportedNotSilentlyZeroed) {
   EXPECT_NE(report.describe().find("without feedback"), std::string::npos);
 }
 
+TEST_F(ShippedConfig, UnpoweredJointsAreExcludedUntilTheNextSeed) {
+  // One motor powered: the silent ones must not be ramped from an assumed 0 -- a drive powered
+  // on mid-session would jump to that stream.
+  std::map<int, double> feedback;
+  const double dir = core.joint(0).direction == 0 ? 1.0 : core.joint(0).direction;
+  feedback[static_cast<int>(core.motorId(0))] = dir * (0.0 - core.joint(0).zero_offset);
+  core.seedPrevTargetsFromFeedback(feedback);
+
+  EXPECT_FALSE(core.isBlocked(0));
+  for (size_t i = 1; i < core.jointCount(); ++i) {
+    EXPECT_TRUE(core.isBlocked(i)) << core.jointName(i);
+  }
+  const auto cmds = core.armPoseToMotorCmds(uniformPose(10.0), kPositionLoop);
+  bool powered_commanded = false;
+  for (const auto& cmd : cmds) {
+    if (cmd.motor_id == core.motorId(0)) {
+      powered_commanded = true;
+      continue;
+    }
+    // Only a silent MIT joint gets anything, and only zero stiffness.
+    EXPECT_EQ(cmd.control_type, kMit) << "motor " << static_cast<int>(cmd.motor_id);
+    EXPECT_FLOAT_EQ(cmd.kp, 0.0f);
+  }
+  EXPECT_TRUE(powered_commanded);
+
+  // Re-seeding with every motor reporting lifts the exclusion: it is not sticky.
+  core.seedPrevTargetsFromFeedback(feedbackForCommandFrame(0.0));
+  for (size_t i = 0; i < core.jointCount(); ++i) {
+    EXPECT_FALSE(core.isBlocked(i)) << core.jointName(i);
+  }
+}
+
 TEST_F(ShippedConfig, JointFoundOutsideItsOwnLimitsIsFlaggedAndExcluded) {
   // The wrist's mapping limits are placeholders; a GL40 sitting at 140 deg is exactly the
   // "calibration disagrees with hardware" case that must NOT be silently clamped.
@@ -379,18 +411,135 @@ TEST_F(ShippedConfig, MitWatchdogCatchesEveryFaultCondition) {
   EXPECT_NE(missing->find("no MIT feedback"), std::string::npos) << *missing;
 }
 
-TEST_F(ShippedConfig, IdleMitCommandsAreZeroGainSoTheyCannotMoveAnything) {
-  const auto idle = core.mitIdleCommands();
-  ASSERT_FALSE(idle.empty());
-  for (const auto& cmd : idle) {
+TEST_F(ShippedConfig, SafeMitCommandsHaveZeroStiffnessSoTheyCannotMoveAnything) {
+  const auto safe = core.mitSafeCommands();
+  ASSERT_FALSE(safe.empty());
+  for (const auto& cmd : safe) {
     EXPECT_EQ(cmd.control_type, kMit);
     EXPECT_FLOAT_EQ(cmd.kp, 0.0f);
-    EXPECT_FLOAT_EQ(cmd.kd, 0.0f);
+    EXPECT_FLOAT_EQ(cmd.kd, 0.0f) << "the shipped GL40 wrist is limp, not damped";
     EXPECT_FLOAT_EQ(cmd.torque, 0.0f);
   }
   const auto enter = core.mitModeCommands(common_msgs::msg::MotorCmd::MIT_ENTER);
-  ASSERT_EQ(enter.size(), idle.size());
+  ASSERT_EQ(enter.size(), safe.size());
   EXPECT_EQ(enter[0].control_type, common_msgs::msg::MotorCmd::MIT_ENTER);
+}
+
+// ---------------------------------------------------------------------------
+// MIT on an AK (gravity-loaded) joint. Elbow roll is switched to MIT in a copy of the shipped
+// config -- the shipped file keeps every AK joint on POSITION_LOOP until bench bring-up.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+constexpr size_t kElbowRoll = 4;
+
+YAML::Node configWithAkElbowRollOnMit(bool with_fault_kd = true) {
+  YAML::Node cfg = YAML::LoadFile(configPath("safety_limits.yaml"))["safety"];
+  YAML::Node j = cfg["joints"]["elbow"]["roll"];
+  j["control_type"] = 0;
+  j["mit_family"] = "ak";
+  j["mit_kp"] = 8.0; // quantised 8.06 * 12 deg = 1.69 N.m <= 5
+  j["mit_kd"] = 0.4;
+  j["mit_max_torque"] = 5.0; // AK80-9 testing ceiling
+  if (with_fault_kd) {
+    j["mit_fault_kd"] = 0.5;
+  }
+  return cfg;
+}
+
+} // namespace
+
+TEST_F(ShippedConfig, AkMitJointDefaultsToDampAndRequiresAFaultKd) {
+  EXPECT_FALSE(core.loadSafetyFromYaml(configWithAkElbowRollOnMit(false), kRateHz));
+  EXPECT_NE(core.lastError().find("mit_fault_kd"), std::string::npos) << core.lastError();
+
+  ASSERT_TRUE(core.loadSafetyFromYaml(configWithAkElbowRollOnMit(), kRateHz)) << core.lastError();
+  EXPECT_EQ(core.safety(kElbowRoll).mit_fault_action, MitFaultAction::Damp);
+  EXPECT_EQ(core.safety(core.jointCount() - 1).mit_fault_action, MitFaultAction::Limp)
+      << "the GL40 wrist keeps its limp default";
+  EXPECT_TRUE(core.hasDampedMitJoints());
+}
+
+TEST_F(ShippedConfig, DampedJointIsHeldWithDampingNotDroppedOrExited) {
+  ASSERT_TRUE(core.loadSafetyFromYaml(configWithAkElbowRollOnMit(), kRateHz)) << core.lastError();
+  const int elbow = static_cast<int>(core.motorId(kElbowRoll));
+  const int wrist = static_cast<int>(core.motorId(core.jointCount() - 1));
+
+  bool saw_elbow = false;
+  for (const auto& cmd : core.mitSafeCommands()) {
+    EXPECT_FLOAT_EQ(cmd.kp, 0.0f) << "a safe command must never have stiffness";
+    if (cmd.motor_id == elbow) {
+      saw_elbow = true;
+      EXPECT_FLOAT_EQ(cmd.kd, 0.5f);
+    } else {
+      EXPECT_FLOAT_EQ(cmd.kd, 0.0f);
+    }
+  }
+  EXPECT_TRUE(saw_elbow);
+
+  const auto damped = core.mitSafeCommands(/*damped_only=*/true);
+  ASSERT_EQ(damped.size(), 1u);
+  EXPECT_EQ(damped[0].motor_id, elbow);
+
+  // The fault path exits only Limp joints: exiting the elbow would cut its damping.
+  const auto exits = core.mitModeCommands(common_msgs::msg::MotorCmd::MIT_EXIT, true);
+  ASSERT_EQ(exits.size(), 1u);
+  EXPECT_EQ(exits[0].motor_id, wrist);
+}
+
+TEST_F(ShippedConfig, AkStatusOneIsOverTemperatureNotEnable) {
+  ASSERT_TRUE(core.loadSafetyFromYaml(configWithAkElbowRollOnMit(), kRateHz)) << core.lastError();
+  seedAtCommandZero();
+  core.armPoseToMotorCmds(uniformPose(0.0), kPositionLoop);
+  const int elbow = static_cast<int>(core.motorId(kElbowRoll));
+  const int wrist = static_cast<int>(core.motorId(core.jointCount() - 1));
+
+  MotorFeedbackSample elbow_fb;
+  elbow_fb.position_deg = core.lastMotorCmdDeg()[kElbowRoll];
+  elbow_fb.torque_nm = 1.0;
+  elbow_fb.status = 0; // AK: no fault
+  elbow_fb.age_s = 0.01;
+  MotorFeedbackSample wrist_fb;
+  wrist_fb.position_deg = core.lastMotorCmdDeg()[core.jointCount() - 1];
+  wrist_fb.status = 1; // GL II: Enable
+  wrist_fb.age_s = 0.01;
+  EXPECT_FALSE(core.checkMitFaults({{elbow, elbow_fb}, {wrist, wrist_fb}}).has_value());
+
+  elbow_fb.status = 1; // AK: motor over-temperature
+  const auto fault = core.checkMitFaults({{elbow, elbow_fb}, {wrist, wrist_fb}});
+  ASSERT_TRUE(fault.has_value());
+  EXPECT_NE(fault->find("elbow.roll"), std::string::npos) << *fault;
+  EXPECT_NE(fault->find("AK error code"), std::string::npos) << *fault;
+}
+
+TEST_F(ShippedConfig, BlockedAkJointGetsDampingInsteadOfGoingLimp) {
+  ASSERT_TRUE(core.loadSafetyFromYaml(configWithAkElbowRollOnMit(), kRateHz)) << core.lastError();
+  seedAtCommandZero();
+  core.blockJoints({kElbowRoll});
+  const int elbow = static_cast<int>(core.motorId(kElbowRoll));
+  bool seen = false;
+  for (const auto& cmd : core.armPoseToMotorCmds(uniformPose(5.0), kPositionLoop)) {
+    if (cmd.motor_id == elbow) {
+      seen = true;
+      EXPECT_EQ(cmd.control_type, kMit);
+      EXPECT_FLOAT_EQ(cmd.kp, 0.0f);
+      EXPECT_FLOAT_EQ(cmd.kd, 0.5f);
+    }
+  }
+  EXPECT_TRUE(seen);
+}
+
+TEST_F(ShippedConfig, UnknownMitFamilyOrFaultActionIsRefused) {
+  YAML::Node cfg = configWithAkElbowRollOnMit();
+  cfg["joints"]["elbow"]["roll"]["mit_family"] = "ak80";
+  EXPECT_FALSE(core.loadSafetyFromYaml(cfg, kRateHz));
+  EXPECT_NE(core.lastError().find("mit_family"), std::string::npos) << core.lastError();
+
+  cfg = configWithAkElbowRollOnMit();
+  cfg["joints"]["elbow"]["roll"]["mit_fault_action"] = "brake";
+  EXPECT_FALSE(core.loadSafetyFromYaml(cfg, kRateHz));
+  EXPECT_NE(core.lastError().find("mit_fault_action"), std::string::npos) << core.lastError();
 }
 
 TEST_F(ShippedConfig, RejectsAMalformedArmPose) {

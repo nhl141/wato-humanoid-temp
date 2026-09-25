@@ -349,6 +349,31 @@ void CanNode::loadMitProfiles() {
     RCLCPP_INFO(this->get_logger(), "Loaded MIT profile for motor %d (%s, family %s)", motor_id,
                 p.model.c_str(), family.c_str());
   }
+
+  // Both families reply on the master id. An AK id equal to a byte 0 some GL II could send
+  // (status 0..0xF in the high nibble, its id nibble in the low one) would be misread as AK
+  // feedback -- so drop the AK profile rather than guess. MIT_CONTROL to it is then refused.
+  std::vector<int> ambiguous;
+  for (const auto& [ak_id, ak] : mit_profiles_) {
+    if (ak.family != MitFamily::Ak) {
+      continue;
+    }
+    for (const auto& [gl_id, gl] : mit_profiles_) {
+      if (gl.family == MitFamily::Gl2 && ak_id >= 0 && ak_id <= 0xFF &&
+          (ak_id & 0xF) == (gl_id & 0xF)) {
+        RCLCPP_ERROR(this->get_logger(),
+                     "AK motor %d and GL II motor %d share id nibble 0x%X: their MIT feedback "
+                     "on the master id is ambiguous. Dropping motor %d's MIT profile -- "
+                     "renumber one drive.",
+                     ak_id, gl_id, ak_id & 0xF, ak_id);
+        ambiguous.push_back(ak_id);
+        break;
+      }
+    }
+  }
+  for (const int id : ambiguous) {
+    mit_profiles_.erase(id);
+  }
 }
 
 void CanNode::encodeSignal(const dbcppp::ISignal* signal, int64_t phys_value, CanMessage& can_msg) {
@@ -383,13 +408,22 @@ void CanNode::sendMitSpecialFrame(int motor_id, uint8_t code, const char* what) 
   publishCanMessage(can_msg);
 }
 
-// MIT feedback is a STANDARD frame on the drive's master id carrying only the low nibble of the
-// motor id, so it cannot be matched through the DBC (whose ids are all extended and fully
-// qualified). Returns true if the frame was consumed as MIT feedback.
+// MIT feedback is a STANDARD frame on the drive's master id, so it cannot be matched through the
+// DBC (whose ids are all extended and fully qualified). Both families reply there:
+//   ak  -- byte 0 is the full motor id
+//   gl2 -- byte 0 is status << 4 | (motor id & 0xF)
+// An exact AK id match is tried first; loadMitProfiles() refuses AK ids that a GL II byte 0
+// could also produce. Returns true if the frame was consumed as MIT feedback.
 bool CanNode::handleMitFeedback(const CanMessage& message) {
   if (message.is_extended_id || static_cast<int>(message.id) != mit_master_id_ ||
       message.data.size() < 8) {
     return false;
+  }
+
+  const auto ak_it = mit_profiles_.find(static_cast<int>(message.data[0]));
+  if (ak_it != mit_profiles_.end() && ak_it->second.family == MitFamily::Ak) {
+    publishAkFeedback(ak_it->first, decodeAkFeedback(message.data.data(), ak_it->second));
+    return true;
   }
 
   const uint8_t id_nibble = message.data[0] & 0xF;
@@ -410,9 +444,9 @@ bool CanNode::handleMitFeedback(const CanMessage& message) {
   }
   if (profile == nullptr) {
     RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                         "MIT feedback on master id 0x%X for unknown motor nibble 0x%X -- no gl2"
-                         " profile matches (see config/mit_profiles.yaml)",
-                         mit_master_id_, id_nibble);
+                         "MIT feedback on master id 0x%X for unknown motor (byte 0 = 0x%02X) -- "
+                         "no ak id or gl2 nibble matches (see config/mit_profiles.yaml)",
+                         mit_master_id_, message.data[0]);
     return true;
   }
 
@@ -428,14 +462,38 @@ bool CanNode::handleMitFeedback(const CanMessage& message) {
   feedback_msg.temperature = static_cast<int8_t>(fb.drive_temp);
   feedback_msg.error_code = static_cast<int8_t>(fb.status);
 
-  if (!mitStatusIsOk(fb.status)) {
+  if (!mitStatusIsOk(fb.status, MitFamily::Gl2)) {
     RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
                           "Motor %d reports MIT status 0x%X (%s)", motor_id, fb.status,
                           mitStatusName(fb.status));
   }
   RCLCPP_DEBUG(this->get_logger(), "MIT feedback motor %d: pos=%.3f deg tau=%.3f Nm %dC (%s)",
                motor_id, feedback_msg.position, fb.torque, fb.drive_temp, mitStatusName(fb.status));
+  publishFeedback(feedback_msg);
+  return true;
+}
 
+void CanNode::publishAkFeedback(int motor_id, const MitAkFeedback& fb) {
+  auto feedback_msg = common_msgs::msg::MotorFeedback();
+  feedback_msg.motor_id = static_cast<int8_t>(motor_id);
+  feedback_msg.position = static_cast<float>(fb.position * 180.0 / M_PI); // degrees, as above
+  feedback_msg.velocity = static_cast<float>(fb.velocity);                // rad/s
+  feedback_msg.current = 0.0f;
+  feedback_msg.torque = static_cast<float>(fb.torque);
+  feedback_msg.temperature = static_cast<int8_t>(fb.motor_temp);
+  feedback_msg.error_code = static_cast<int8_t>(fb.error);
+
+  if (!mitStatusIsOk(fb.error, MitFamily::Ak)) {
+    RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                          "Motor %d reports AK MIT error %d (%s)", motor_id, fb.error,
+                          mitAkErrorName(fb.error));
+  }
+  RCLCPP_DEBUG(this->get_logger(), "AK MIT feedback motor %d: pos=%.3f deg tau=%.3f Nm %dC (%s)",
+               motor_id, feedback_msg.position, fb.torque, fb.motor_temp, mitAkErrorName(fb.error));
+  publishFeedback(feedback_msg);
+}
+
+void CanNode::publishFeedback(const common_msgs::msg::MotorFeedback& feedback_msg) {
   auto pub = std::dynamic_pointer_cast<rclcpp::Publisher<common_msgs::msg::MotorFeedback>>(
       _publishers["/interfacing/motorFeedback"]);
   if (pub) {
@@ -443,7 +501,6 @@ bool CanNode::handleMitFeedback(const CanMessage& message) {
   } else {
     RCLCPP_ERROR(this->get_logger(), "Publisher for /interfacing/motorFeedback not found");
   }
-  return true;
 }
 
 void CanNode::receiveCanMessages() {

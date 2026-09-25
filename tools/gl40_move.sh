@@ -7,7 +7,7 @@
 #
 #   tools/gl40_move.sh --id 22 --deg 40 --kp 1.22 --max-track-err 12
 #   tools/gl40_move.sh --id 22 --monitor              # Ctrl-C to stop
-#   GL40_TOOL=gl40_bench.sh tools/gl40_move.sh --id 22 --step 5 --sweep "0.61,1.22"
+#   GL40_TOOL=gl40_bench.py tools/gl40_move.sh --id 22 --step 5 --sweep "0.61,1.22"
 #
 # Env: GL40_SERVICE (default interfacing), GL40_TOOL (gl40_mit_move.py | gl40_bench.py),
 #      GL40_NO_PLOT=1 to skip plotting.

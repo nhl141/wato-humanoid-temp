@@ -31,121 +31,25 @@ from __future__ import annotations
 
 import argparse
 import math
-import os
 import signal
 import sys
 import time
-from pathlib import Path
 from typing import Dict, List, Optional
 
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 
-import yaml
-
 from common_msgs.msg import ArmPose, MotorCmd, MotorFeedback
 
+from joint_config import find_mapping, load_joint_map, load_safety_limits
 from telemetry import RunFolder
-
-# The six ArmPose slots, in message order -- identical to joint_command_core.cpp's jointPaths().
-ARM_POSE_JOINTS = [
-    ("shoulder", "pitch"), ("shoulder", "roll"), ("shoulder", "yaw"),
-    ("elbow", "pitch"), ("elbow", "roll"), ("wrist", "pitch"),
-]
-
-DEFAULT_MAPPINGS = [
-    "/calibration/hardware_mapping.yaml",  # bind-mounted in both containers
-    "/root/ament_ws/src/interfacing/joint_command/config/hardware_mapping.yaml",
-    "/root/ament_ws/src/joint_command/config/hardware_mapping.yaml",
-]
 
 # GL II status nibble (MIT feedback). Servo feedback uses the DBC's own error codes.
 MIT_STATUS = {
     0: "Disable", 1: "Enable", 8: "Over-voltage", 9: "Under-voltage", 10: "Over-current",
     11: "MOS over-temp", 12: "Winding over-temp", 13: "Comms loss", 14: "Overload",
 }
-
-
-SAFETY_LIMITS = [
-    "/opt/joint_command_config/safety_limits.yaml",
-    "/root/ament_ws/src/joint_command/config/safety_limits.yaml",
-    "/root/ament_ws/src/interfacing/joint_command/config/safety_limits.yaml",
-]
-
-
-def load_safety_limits(explicit: Optional[str]):
-    """Per-joint velocity_max / MIT thresholds, so the plots can draw the real ceilings.
-
-    Without this the telemetry would show a velocity trace with nothing to judge it against.
-    Returns ({joint_name: velocity_max_dps}, {joint_name: {mit thresholds}}) -- empty if the
-    file cannot be found, which only costs the reference lines.
-    """
-    for path in ([explicit] if explicit else SAFETY_LIMITS):
-        if not path or not Path(path).exists():
-            continue
-        cfg = (yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}).get("safety", {})
-        default = cfg.get("global", {}) or {}
-        vmax, mit = {}, {}
-        for group, joints in (cfg.get("joints") or {}).items():
-            for joint, node in (joints or {}).items():
-                node = node or {}
-                name = f"{group}.{joint}"
-                vmax[name] = float(node.get("velocity_max", default.get("velocity_max", 0)) or 0)
-                if int(node.get("control_type", default.get("control_type", -1))) == 0:
-                    mit[name] = {
-                        "mit_kp": node.get("mit_kp", default.get("mit_kp")),
-                        "mit_kd": node.get("mit_kd", default.get("mit_kd")),
-                        "max_torque_nm": node.get("mit_max_torque",
-                                                  default.get("mit_max_torque")),
-                        "max_track_err_deg": node.get("mit_max_track_err",
-                                                      default.get("mit_max_track_err")),
-                    }
-        return vmax, mit
-    return {}, {}
-
-
-def find_mapping(explicit: Optional[str]) -> Path:
-    candidates = [explicit] if explicit else DEFAULT_MAPPINGS
-    for path in candidates:
-        if path and Path(path).exists():
-            return Path(path)
-    raise SystemExit("could not find hardware_mapping.yaml; pass --mapping PATH "
-                     f"(looked in: {', '.join(DEFAULT_MAPPINGS)})")
-
-
-def load_joint_map(path: Path, arm_side: str):
-    """-> {motor_id: {"name", "direction", "zero_offset", "lower", "upper", "slot"}}"""
-    data = yaml.safe_load(path.read_text(encoding="utf-8"))
-    if arm_side not in data:
-        raise SystemExit(f"arm side '{arm_side}' not in {path} (have {list(data)})")
-
-    out: Dict[int, dict] = {}
-
-    def walk(node, prefix: str) -> None:
-        if not isinstance(node, dict):
-            return
-        if "can_id" in node:
-            out[int(node["can_id"])] = {
-                "name": prefix,
-                "direction": float(node.get("direction", 1)) or 1.0,
-                "zero_offset": float(node.get("zero_offset", 0.0)),
-                "lower": float(node.get("lower_limit", float("-inf"))),
-                "upper": float(node.get("upper_limit", float("inf"))),
-                "limit_range": bool(node.get("limit_range", False)),
-                "slot": None,
-            }
-            return
-        for key, child in node.items():
-            walk(child, f"{prefix}.{key}" if prefix else key)
-
-    walk(data[arm_side], "")
-    # Tag the six joints an ArmPose carries, so their setpoints can be matched up.
-    for slot, (group, joint) in enumerate(ARM_POSE_JOINTS):
-        node = data[arm_side].get(group, {}).get(joint)
-        if node and int(node["can_id"]) in out:
-            out[int(node["can_id"])]["slot"] = slot
-    return out
 
 
 class TelemetryRecorder(Node):
@@ -162,6 +66,9 @@ class TelemetryRecorder(Node):
         self.seen: set = set()
         self.rows = 0
         self.first_pose_time: Optional[float] = None
+        # Written into every row; a driver running in the same process (arm_roundtrip.py) sets
+        # it so the plots can band the run by phase.
+        self.phase = "stream"
 
         qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                          history=HistoryPolicy.KEEP_LAST, depth=50)
@@ -182,14 +89,21 @@ class TelemetryRecorder(Node):
                 self.requested[motor_id] = float(slots[slot])
 
     def _on_cmd(self, msg: MotorCmd) -> None:
+        # Only these carry a position setpoint. MIT_ENTER/EXIT/SET_ZERO, DISABLE, ... leave the
+        # field at 0, and recording that as "commanded 0" invents a huge tracking error.
+        if msg.control_type not in (MotorCmd.MIT_CONTROL, MotorCmd.POSITION_LOOP,
+                                    MotorCmd.POSITION_VELOCITY):
+            return
         motor_id = int(msg.motor_id)
         info = self.joint_map.get(motor_id, {})
         direction = info.get("direction", 1.0) or 1.0
         zero = info.get("zero_offset", 0.0)
         # MIT_CONTROL carries radians; every servo mode carries degrees. Both are motor frame.
         deg = math.degrees(msg.position) if msg.control_type == 0 else float(msg.position)
-        if msg.control_type == 0 and msg.kp == 0.0 and msg.kd == 0.0:
-            return  # zero-gain "poke" frame: not a real setpoint, it cannot move anything
+        if msg.control_type == 0 and msg.kp == 0.0:
+            # No stiffness, so the position field means nothing: a zero-gain "poke", or a
+            # damped fault/seeding frame (kd > 0 on an AK) -- neither is a setpoint.
+            return
         self.setpoints[motor_id] = zero + deg / direction
 
     def _on_feedback(self, msg: MotorFeedback) -> None:
@@ -211,7 +125,7 @@ class TelemetryRecorder(Node):
             self.log.row(
                 motor_id=motor_id,
                 joint=info.get("name", f"motor{motor_id}"),
-                phase="stream",
+                phase=self.phase,
                 sp_deg=self.setpoints.get(motor_id),
                 sp_raw_deg=self.requested.get(motor_id),
                 pos_deg=pos_cmd_deg,

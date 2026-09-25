@@ -19,10 +19,16 @@ the defaults are +-12.5 rad / +-200 / +-10 N.m. If the drive is configured diffe
 
 Safety (see .claude/skills/real-hardware-safety/SKILL.md): reads the current position before
 moving, holds there first, ramps the setpoint slowly, refuses gains that could exceed
---max-torque at the commanded error, clamps every setpoint to --soft-limits, aborts on torque /
-tracking-error / shaft-velocity / soft-limit / temperature / error code / lost feedback, and
-sends "exit motor mode" (motor goes limp) on Ctrl-C or any failure. Nothing here replaces a
-HARDWARE E-STOP on the motor supply.
+--max-torque at the commanded error, clamps every setpoint to --soft-limits, and aborts on
+torque / tracking-error / shaft-velocity / soft-limit / temperature / error code / lost
+feedback by sending "exit motor mode" (motor goes limp) at once. A finished move -- or Ctrl-C --
+ramps back to the starting angle first and only then frees the motor, so a loaded joint is never
+dropped from the target; a second Ctrl-C frees immediately. Nothing here replaces a HARDWARE
+E-STOP on the motor supply.
+
+Limits come from the files joint_command enforces for teleop: kp/kd, --max-torque and
+--max-track-err from the joint's safety_limits.yaml block, --max-setpoint-vel from its
+velocity_max, --soft-limits from its hardware_mapping.yaml range. Flags may only tighten them.
 
 Every real run writes a telemetry run folder (telemetry.csv + run.json) -- see telemetry.py and
 tools/gl40_telemetry_plot.py for the plots. --no-log opts out.
@@ -33,9 +39,9 @@ Examples (inside the interfacing container; can0 is brought up by can_node / set
   sudo python3 $S --selftest                      # packing vs. manual example, no bus
   sudo python3 $S --id 22 --monitor               # zero-torque; turn shaft by hand, check rad scale
   sudo python3 $S --id 22 --deg 40 --dry-run      # print the frames that would be sent
-  sudo python3 $S --id 22 --deg 40                # +40 deg from current position, then go limp
-  sudo python3 $S --id 22 --deg 40 --hold         # ...and keep holding until Ctrl-C
-  sudo python3 $S --id 22 --deg 40 --soft-limits 120,200   # ...refusing to leave 120..200 deg
+  sudo python3 $S --id 22 --deg 40                # +40 deg, settle, back to start, then go limp
+  sudo python3 $S --id 22 --deg 40 --hold         # ...holding at +40 until Ctrl-C, then back
+  sudo python3 $S --id 22 --deg 40 --soft-limits 120,150   # ...inside a tighter range
 """
 
 from __future__ import annotations
@@ -51,6 +57,7 @@ import time
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
+import joint_config as jc
 from telemetry import RunFolder
 
 # ---------------------------------------------------------------------------
@@ -285,6 +292,9 @@ class Motor:
         self.joint = joint
         self.last_fb: Optional[Feedback] = None
         self.last_fb_time = time.monotonic()
+        # Last position actually commanded WITH stiffness (after the soft-limit clamp): where a
+        # return-to-start ramp has to begin so it does not jump. Zero-gain pokes do not count.
+        self.last_sp: Optional[float] = None
 
     def record(self, phase: str, setpoint: Optional[float], fb: Optional[Feedback]) -> None:
         """One telemetry row. Called every tick, with or without fresh feedback."""
@@ -320,6 +330,8 @@ class Motor:
         # walk past the limit simply stops there.
         p = clamp_setpoint(p, self.lim.soft_lo, self.lim.soft_hi)
         self.bus.send(self.id, pack_mit(p, v, kp, kd, t, self.r))
+        if kp > 0.0:
+            self.last_sp = p
 
     # --- feedback --------------------------------------------------------
     def read_feedback(self, timeout_s: float) -> Optional[Feedback]:
@@ -376,12 +388,23 @@ class Motor:
 # ---------------------------------------------------------------------------
 
 _stop_requested = False
+_stop_count = 0
+
+
+class StopRequested(Abort):
+    """Ctrl-C / SIGTERM, as opposed to a safety abort: the motor is still trustworthy, so the
+    first one ramps back to where the move started before freeing; the second frees at once."""
 
 
 def _on_signal(signum, _frame):
-    global _stop_requested
+    global _stop_requested, _stop_count
     _stop_requested = True
-    print(f"\n[signal {signum}] stopping -- motor will be freed", flush=True)
+    _stop_count += 1
+    if _stop_count == 1:
+        print(f"\n[signal {signum}] stopping -- returning to the start position, then freeing "
+              f"(Ctrl-C again to free immediately)", flush=True)
+    else:
+        print(f"\n[signal {signum}] freeing the motor now", flush=True)
 
 
 def _tick_sleep(t_next: float) -> float:
@@ -404,6 +427,7 @@ def phase_wake(m: Motor, timeout_s: float = 0.5) -> Feedback:
         raise Abort(f"motor {m.id} did not answer on master id 0x{m.master_id:03X} -- check "
                     f"CAN id, that the drive is in MIT mode, wiring, termination, and that "
                     f"nothing else is holding the bus")
+    check_origin(fb.pos, m.lim.soft_lo, m.lim.soft_hi, m.joint)
     m.check(fb, None)
     if abs(fb.pos) > m.r.p_max * 0.999:
         raise Abort(f"reported position {fb.pos:+.3f} rad is at the +-{m.r.p_max} rad packing "
@@ -429,15 +453,19 @@ def phase_monitor(m: Motor, rate_hz: float = 10.0) -> None:
 
 
 def phase_servo(m: Motor, start: float, end: float, duration_s: float, kp: float, kd: float,
-                rate_hz: float, label: str) -> None:
-    """Hold (start == end) or linearly ramp the setpoint from start to end over duration_s."""
+                rate_hz: float, label: str, stops_allowed: int = 0) -> None:
+    """Hold (start == end) or linearly ramp the setpoint from start to end over duration_s.
+
+    Raises StopRequested once more than `stops_allowed` Ctrl-Cs have arrived: 0 for the move
+    itself, 1 for the return, so only a second Ctrl-C interrupts the way back.
+    """
     period = 1.0 / rate_hz
     n = max(int(round(duration_s * rate_hz)), 1)
     t_next = time.monotonic()
     last_print = 0.0
     for i in range(n + 1):
-        if _stop_requested:
-            raise Abort("stop requested")
+        if _stop_count > stops_allowed:
+            raise StopRequested("stop requested")
         alpha = i / n
         sp = start + (end - start) * alpha
         m.command(sp, 0.0, kp, kd, 0.0)
@@ -453,6 +481,21 @@ def phase_servo(m: Motor, start: float, end: float, duration_s: float, kp: float
                   flush=True)
         t_next = _tick_sleep(t_next + period)
     print()
+
+
+def phase_return(m: Motor, start: float, kp: float, kd: float, rate_hz: float,
+                 rest_s: float = 1.0, min_duration_s: float = 0.5) -> None:
+    """Ramp from wherever the setpoint is now back to `start` at <= max_setpoint_vel, then rest.
+
+    This is what keeps a move from ending in a drop: the motor is only freed back where it
+    started (its resting pose), never at the target. It tolerates the first Ctrl-C (the one that
+    usually triggers it); a second one raises StopRequested and the caller frees immediately.
+    """
+    here = m.last_sp if m.last_sp is not None else start
+    duration = max(abs(start - here) / m.lim.max_setpoint_vel, min_duration_s)
+    print(f"Returning: {here / DEG:+.1f} -> {start / DEG:+.1f} deg over {duration:.1f} s")
+    phase_servo(m, here, start, duration, kp, kd, rate_hz, "return", stops_allowed=1)
+    phase_servo(m, start, start, rest_s, kp, kd, rate_hz, "rest", stops_allowed=1)
 
 
 def phase_free(m: Motor, repeats: int = 3) -> None:
@@ -474,6 +517,103 @@ def parse_soft_limits(text: Optional[str]) -> Tuple[Optional[float], Optional[fl
         raise ValueError("--soft-limits wants exactly LO,HI in degrees, e.g. 120,200")
     lo, hi = (float(parts[0]) * DEG, float(parts[1]) * DEG)
     return (min(lo, hi), max(lo, hi))
+
+
+def apply_joint_config(args, need_gains: bool) -> dict:
+    """Fill unset limits from the SAME yaml joint_command enforces; refuse any that loosen it.
+
+    Teleop and arm_roundtrip.py move the arm through joint_command, so hardware_mapping.yaml's
+    angle limits and safety_limits.yaml's velocity_max / mit_* values bind them. This bench
+    tool talks to the drive directly, so it loads those files itself:
+
+      --kp / --kd            default: the joint's mit_kp / mit_kd (may differ, for gain sweeps --
+                             but the stall rule below is checked against the yaml's ceilings)
+      --max-torque           default and ceiling: mit_max_torque
+      --max-track-err        default and ceiling: mit_max_track_err
+      --max-setpoint-vel     default and ceiling: velocity_max (deg/s -> rad/s)
+      --soft-limits          default and outer bound: lower_limit/upper_limit, in the drive frame
+
+    Mutates args in place and returns the provenance for run.json.
+    """
+    mapping = jc.find_mapping(args.mapping)
+    joint_map = jc.load_joint_map(mapping, args.arm_side)
+    info = joint_map.get(args.id)
+    if info is None:
+        sys.exit(f"motor {args.id} is not in {mapping} ({args.arm_side} arm): no limits to "
+                 f"enforce, refusing. Known ids: {sorted(joint_map)}")
+    family = jc.drive_family(args.id)
+    if family is not None and family != "gl2":
+        sys.exit(f"motor {args.id} ({info['name']}) is a '{family}' drive; this tool speaks the "
+                 f"GL II protocol only. Move AK joints through joint_command "
+                 f"(tools/arm_roundtrip.sh).")
+    safety_path = jc.find_safety_limits(args.safety_limits)
+    if safety_path is None:
+        sys.exit("could not find safety_limits.yaml; pass --safety-limits PATH "
+                 f"(looked in: {', '.join(jc.SAFETY_LIMITS)})")
+    blk = jc.joint_safety(safety_path, info["name"])
+    if not args.joint:
+        args.joint = info["name"]
+
+    def ceiling(flag: str, value, limit, unit: str, scale: float = 1.0):
+        if limit is None:
+            if value is None:
+                sys.exit(f"{safety_path} gives no value for {flag} on {info['name']}; pass it")
+            return value
+        limit = float(limit) * scale
+        if value is None:
+            return limit
+        if value > limit + 1e-9:
+            sys.exit(f"{flag} {value / scale:g} {unit} is looser than {info['name']}'s "
+                     f"{limit / scale:g} {unit} in {safety_path}. Flags may only tighten the "
+                     f"limits teleop runs under; change the yaml (and rebuild joint_command) to "
+                     f"raise it for everyone.")
+        return value
+
+    args.max_torque = ceiling("--max-torque", args.max_torque, blk.get("mit_max_torque"), "N.m")
+    args.max_track_err = ceiling("--max-track-err", args.max_track_err,
+                                 blk.get("mit_max_track_err"), "deg")
+    args.max_setpoint_vel = ceiling("--max-setpoint-vel", args.max_setpoint_vel,
+                                    blk.get("velocity_max"), "deg/s", DEG)
+
+    if need_gains:
+        for flag, attr, key in (("--kp", "kp", "mit_kp"), ("--kd", "kd", "mit_kd")):
+            if getattr(args, attr) is None:
+                shipped = float(blk.get(key) or 0.0)
+                if shipped <= 0.0:
+                    sys.exit(f"{safety_path} has no validated {key} for {info['name']} (0 = "
+                             f"untuned); pass {flag} explicitly")
+                setattr(args, attr, shipped)
+
+    lo_y, hi_y = jc.motor_frame_limits_deg(info)
+    if args.soft_limits is None:
+        if lo_y is not None:
+            args.soft_limits = f"{lo_y:g},{hi_y:g}"
+    elif lo_y is not None:
+        lo, hi = parse_soft_limits(args.soft_limits)
+        if lo < lo_y * DEG - 1e-9 or hi > hi_y * DEG + 1e-9:
+            sys.exit(f"--soft-limits {args.soft_limits} reaches outside {info['name']}'s "
+                     f"[{lo_y:g}, {hi_y:g}] deg (drive frame; command frame "
+                     f"[{info['lower']:g}, {info['upper']:g}] in {mapping})")
+
+    return {
+        "mapping": str(mapping), "safety_limits": str(safety_path), "joint": info["name"],
+        "drive_frame_limits_deg": None if lo_y is None else [lo_y, hi_y],
+        "command_frame_limits_deg": [info["lower"], info["upper"]] if info["limit_range"]
+        else None,
+        "yaml_block": blk,
+    }
+
+
+def check_origin(pos: float, soft_lo: Optional[float], soft_hi: Optional[float],
+                 joint: str) -> None:
+    """Refuse to stiffen a joint that already sits outside its limits -- joint_command excludes
+    such a joint too (stale calibration or placeholder limits), rather than walk it back."""
+    if outside_soft_limits(pos, soft_lo, soft_hi, 0.0):
+        lo = "-inf" if soft_lo is None else f"{soft_lo / DEG:+.1f}"
+        hi = "+inf" if soft_hi is None else f"{soft_hi / DEG:+.1f}"
+        raise Abort(f"{joint or 'motor'} is at {pos / DEG:+.1f} deg, outside its limits [{lo}, "
+                    f"{hi}] deg (drive frame). Its calibration is stale or the limits are "
+                    f"placeholders -- run calibrate_arm.py for it first.")
 
 
 # ---------------------------------------------------------------------------
@@ -548,26 +688,33 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--selftest", action="store_true", help="check frame packing, no bus")
     ap.add_argument("--absolute", action="store_true",
                     help="target is absolute (drive zero); default is relative to current position")
-    ap.add_argument("--kp", type=float, default=0.366,
-                    help="N.m/rad, snapped to the nearest 500/4096 count (default raw 3 = 0.366); "
-                         "kp * --max-track-err must stay under --max-torque")
-    ap.add_argument("--kd", type=float, default=0.0098,
-                    help="N.m.s/rad, snapped to the nearest 5/4096 count; must be > 0 (default raw 8)")
+    ap.add_argument("--kp", type=float,
+                    help="N.m/rad, snapped to the nearest 500/4096 count (default: the joint's "
+                         "mit_kp in safety_limits.yaml); kp * --max-track-err must stay under "
+                         "--max-torque")
+    ap.add_argument("--kd", type=float,
+                    help="N.m.s/rad, snapped to the nearest 5/4096 count; must be > 0 (default: "
+                         "the joint's mit_kd)")
     ap.add_argument("--duration", type=float, default=4.0, help="ramp time, s (default 4)")
     ap.add_argument("--rate", type=float, default=50.0, help="command rate, Hz (default 50)")
     ap.add_argument("--hold", action="store_true",
-                    help="keep holding at the target until Ctrl-C instead of freeing the motor")
+                    help="keep holding at the target until Ctrl-C, then return and free")
+    ap.add_argument("--no-return", action="store_true",
+                    help="free the motor AT the target instead of ramping back to where it "
+                         "started first (old behaviour: a loaded joint drops from the target)")
     ap.add_argument("--p-max", type=float, default=12.5, help="drive P range, rad (default 12.5)")
     ap.add_argument("--v-max", type=float, default=200.0, help="drive V range (default 200)")
     ap.add_argument("--t-max", type=float, default=10.0, help="drive T range, N.m (default 10)")
-    ap.add_argument("--max-torque", type=float, default=0.3,
+    ap.add_argument("--max-torque", type=float,
                     help="N.m: refuse kp*|error| above this and abort on feedback above it "
-                         "(default 0.3 -- GL40 rated 0.25, peak 0.73)")
-    ap.add_argument("--max-track-err", type=float, default=15.0,
-                    help="deg: abort if the motor lags the setpoint by more (default 15)")
+                         "(default and ceiling: the joint's mit_max_torque)")
+    ap.add_argument("--max-track-err", type=float,
+                    help="deg: abort if the motor lags the setpoint by more (default and "
+                         "ceiling: the joint's mit_max_track_err)")
     ap.add_argument("--max-temp", type=int, default=60, help="degC abort threshold (default 60)")
-    ap.add_argument("--max-setpoint-vel", type=float, default=1.0,
-                    help="rad/s: --duration is stretched so the ramp never exceeds this (default 1)")
+    ap.add_argument("--max-setpoint-vel", type=float,
+                    help="rad/s: --duration is stretched so the ramp never exceeds this "
+                         "(default and ceiling: the joint's velocity_max)")
     ap.add_argument("--max-shaft-vel", type=float, default=3.0,
                     help="rad/s: abort if the drive reports the shaft moving faster (default 3 "
                          "= the GL40 testing limit in the real-hardware-safety skill). The "
@@ -576,8 +723,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--soft-limits", metavar="LO,HI",
                     help="degrees in the DRIVE frame: refuse targets outside, clamp every "
                          "setpoint to the range, and abort if the shaft escapes it by more "
-                         "than --soft-limit-margin (default: no limits, only the drive's "
-                         "+-p-max packing range applies)")
+                         "than --soft-limit-margin (default and outer bound: the joint's "
+                         "hardware_mapping.yaml limits, converted to the drive frame)")
     ap.add_argument("--soft-limit-margin", type=float, default=2.0,
                     help="deg of PD sag tolerated past a soft limit before aborting (default 2)")
     ap.add_argument("--clamp-target", action="store_true",
@@ -590,7 +737,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--no-log", action="store_true",
                     help="skip the telemetry run folder (telemetry is written by default)")
     ap.add_argument("--joint", default="",
-                    help="joint name recorded in telemetry, e.g. wrist.pitch")
+                    help="joint name recorded in telemetry (default: from hardware_mapping.yaml)")
+    ap.add_argument("--mapping", help="hardware_mapping.yaml (default: the one joint_command uses)")
+    ap.add_argument("--safety-limits", help="safety_limits.yaml (default: joint_command's)")
+    ap.add_argument("--arm-side", default="left")
     ap.add_argument("--dry-run", action="store_true",
                     help="print the frames instead of sending them (no feedback -> no move)")
     return ap
@@ -603,6 +753,12 @@ def main(argv=None) -> int:
         return 0
     if not (args.monitor or args.deg is not None or args.rad is not None):
         build_parser().error("one of --deg / --rad / --monitor / --selftest is required")
+
+    config = apply_joint_config(args, need_gains=not args.monitor)
+    if args.monitor:
+        # Zero torque commands nothing, so there is no limit to enforce -- and --monitor is how
+        # you find where an uncalibrated joint really is, which its limits would refuse.
+        args.soft_limits = None
 
     ranges = MitRanges(p_max=args.p_max, v_max=args.v_max, t_max=args.t_max)
     try:
@@ -693,6 +849,8 @@ def main(argv=None) -> int:
                 "kp_raw": kp_raw, "kd_raw": kd_raw,
             },
             "velocity_scale_verified": False,
+            "config": config,
+            "return_to_start": not (args.monitor or args.no_return),
         },
     )
     if log.enabled:
@@ -763,10 +921,29 @@ def main(argv=None) -> int:
             print(f"Reached: pos={fb.pos:+.4f} rad ({fb.pos / DEG:+.1f} deg), "
                   f"error {(fb.pos - target) / DEG:+.2f} deg")
         if args.hold:
-            print("Holding at target. Ctrl-C to free the motor.")
-            while not _stop_requested:
-                phase_servo(m, target, target, 1.0, kp_send, kd_send, args.rate, "hold")
+            print("Holding at target. Ctrl-C to return to the start and free the motor.")
+            try:
+                while True:
+                    phase_servo(m, target, target, 1.0, kp_send, kd_send, args.rate, "hold")
+            except StopRequested:
+                pass  # the normal way out of --hold; the second Ctrl-C still frees at once
+        if not args.no_return:
+            # No faster than the way out.
+            phase_return(m, cur, kp_send, kd_send, args.rate, min_duration_s=duration)
         return 0
+    except StopRequested:
+        # Ctrl-C mid-move. Unlike a safety abort the drive is still trustworthy, so bring the
+        # joint back to its resting pose before freeing it -- freeing here would drop it.
+        log.note(outcome="stopped", abort_reason="stop requested")
+        rc = 2
+        if not (args.monitor or args.dry_run or args.no_return) and _stop_count < 2:
+            try:
+                phase_return(m, cur, kp_send, kd_send, args.rate)
+            except StopRequested:
+                print("\nSecond stop: freeing where it is.")
+            except Abort as e:
+                print(f"\nABORT during return: {e}")
+                log.note(outcome="aborted", abort_reason=f"during return: {e}")
     except Abort as e:
         print(f"\nABORT: {e}")
         log.note(outcome="aborted", abort_reason=str(e))
