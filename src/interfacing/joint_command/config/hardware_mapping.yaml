@@ -10,9 +10,9 @@ left:
     roll:
       can_id: 13
       direction: -1
-      zero_offset: 151.1999969482422
-      lower_limit: -112.69999694824219
-      upper_limit: 89.0999984741211
+      zero_offset: -92.9000015258789
+      lower_limit: -153.5
+      upper_limit: 135.20000457763672
       limit_range: true
     yaw:
       can_id: 12
@@ -39,10 +39,10 @@ left:
   wrist:
     pitch:
       can_id: 22
-      lower_limit: -79.4389533996582
-      upper_limit: 90.47671127319336
+      lower_limit: -60.1392765045166
+      upper_limit: 61.8441162109375
       direction: 1
-      zero_offset: 55.15598678588867
+      zero_offset: -93.34005737304688
       limit_range: true
   gripper:
     open_close:

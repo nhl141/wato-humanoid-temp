@@ -65,12 +65,12 @@ safety:
       pitch:   # AK10-9, id 14 -- most gravity load, bring up LAST
         velocity_max: 30.0
         delta_max: 2.0
-        # control_type: 0
-        # mit_family: ak
-        # mit_kp: 15.0           # -> 15.01 applied; x 0.2094 rad = 3.14 N.m <= 10
-        # mit_kd: 0.8
-        # mit_max_torque: 10.0
-        # mit_fault_kd: 1.0
+        control_type: 0
+        mit_family: ak
+        mit_kp: 15.0           # -> 15.01 applied; x 0.2094 rad = 3.14 N.m <= 10
+        mit_kd: 0.8
+        mit_max_torque: 10.0
+        mit_fault_kd: 1.0
       roll:    # AK10-9, id 12
         velocity_max: 10.0
         delta_max: 2.0
@@ -81,7 +81,7 @@ safety:
         # mit_max_torque: 10.0
         # mit_fault_kd: 1.0
       yaw:     # AK80-9, id 11
-        velocity_max: 10.0
+        velocity_max: 60.0
         delta_max: 2.0
         # control_type: 0
         # mit_family: ak
@@ -131,12 +131,13 @@ safety:
     # follow-up (see can/README.md).
     wrist:
       pitch:
-        control_type: 0        # MIT_CONTROL
-        mit_family: gl2        # fault action defaults to limp: unloaded, safe to free
-        velocity_max: 10.0
+        velocity_max: 30.0
         delta_max: 2.4
-        mit_kp: 1.22           # N.m/rad  -> raw 10 -> 1.2207 applied
-        mit_kd: 0.0098         # N.m.s/rad -> raw 8 -> 0.00977 applied
-        mit_max_torque: 0.3    # N.m, fault above
-        mit_max_track_err: 12.0  # deg, fault above
-        mit_feedback_timeout: 0.2  # s without feedback -> fault
+        
+        # control_type: 0        # MIT_CONTROL
+        # mit_family: gl2        # fault action defaults to limp: unloaded, safe to free
+        # mit_kp: 1.22           # N.m/rad  -> raw 10 -> 1.2207 applied
+        # mit_kd: 0.0098         # N.m.s/rad -> raw 8 -> 0.00977 applied
+        # mit_max_torque: 0.3    # N.m, fault above
+        # mit_max_track_err: 12.0  # deg, fault above
+        # mit_feedback_timeout: 0.2  # s without feedback -> fault
