@@ -253,7 +253,7 @@ void JointCommandNode::controlTimerCallback() {
   if (!seeded_from_feedback_) {
     // The constructor's MIT_ENTER is sent before DDS has matched can_node, so it can be lost
     // -- and a drive that never entered silently ignores every gain it is later sent (seen in
-    // gl40_sim: a 5 deg move that never moved, too small to trip the tracking watchdog). Keep
+    // simulation: a 5 deg move that never moved, too small to trip the tracking watchdog). Keep
     // re-entering while unseeded; the gains are zero here, so entering commands no torque.
     // Also covers a drive power-cycled while this node is up. Every 0.5 s for the first 5 s
     // (the startup race), then every 5 s so an idle node doesn't flood can_node's log.

@@ -290,7 +290,7 @@ def main(argv=None) -> int:
         if others:
             raise SystemExit("something else is publishing /arm/joint_targets ("
                              + ", ".join(sorted({i.node_name for i in others}))
-                             + "); stop it (teleop, gl40_ros_move.sh, ros2 topic pub) first")
+                             + "); stop it (teleop, ros2 topic pub) first")
         consumers = [i for i in node.get_subscriptions_info_by_topic("/arm/joint_targets")
                      if i.node_name != node.get_name()]
         if not consumers:

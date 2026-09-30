@@ -82,7 +82,7 @@ safety:
     # gravity_ff_max_torque below = model worst case over the URDF limits + ~15% for CAD
     # mass error; each already satisfies the startup rule with the gains beside it.
     shoulder:
-      pitch:   # AK10-9, id 14 -- most gravity load, bring up LAST
+      pitch:   # AK10-9, id 14 
         velocity_max: 30.0
         delta_max: 2.0
         control_type: 0
@@ -96,7 +96,7 @@ safety:
         urdf_offset_deg: 0.0         
 
         gravity_assume_deg: 0.0
-      roll:    # AK10-9, id 12
+      roll:    # AK10-9, id 13
         velocity_max: 30.0
         delta_max: 2.0
         control_type: 0
@@ -109,7 +109,7 @@ safety:
         urdf_direction: 1            
         urdf_offset_deg: 0.0         
         gravity_assume_deg: 0.0
-      yaw:     # AK80-9, id 11
+      yaw:     # AK80-9, id 12
         velocity_max: 60.0
         delta_max: 2.0
         control_type: 0
@@ -123,7 +123,7 @@ safety:
         urdf_offset_deg: 0.0         
         gravity_assume_deg: 0.0
     elbow:
-      pitch:   # AK80-9, id 10
+      pitch:   # AK80-9, id 11
         velocity_max: 30.0
         delta_max: 1.6
         control_type: 0
@@ -139,27 +139,27 @@ safety:
         gravity_ff_max_torque: 3.59     
 
         gravity_assume_deg: 0.0
-      roll:    # AK80-9, id 13 -- least gravity load, bring up FIRST
-        # velocity_max: 30.0
-        # delta_max: 1.6
-        # control_type: 0
-        # mit_family: ak
-        # mit_kp: 36.0
-        # mit_kd: 0.4
-        # mit_max_torque: 18.0
-        # mit_fault_kd: 0.5
-        # gravity_ff_max_torque: 3.3   # model max 0.18 N.m
-        # urdf_direction: 1            
-        # urdf_offset_deg: 0.0         
+      roll:    # AK80-9, id 104
+        velocity_max: 30.0
+        delta_max: 1.6
+        control_type: 0
+        mit_family: ak
+        mit_kp: 36.0
+        mit_kd: 0.4
+        mit_max_torque: 18.0
+        mit_fault_kd: 0.5
+        gravity_ff_max_torque: 3.3   # model max 0.18 N.m
+        urdf_direction: 1            
+        urdf_offset_deg: 0.0         
 
-        # gravity_assume_deg: 0.0
+        gravity_assume_deg: 0.0
 
     # --- GL40 KV70 on a GL II drive, MIT_CONTROL ---------------------------
     # This joint is a PD drive: the motor applies
     #   torque = mit_kp * (target - actual) + mit_kd * (0 - velocity)
     # and has NO internal limit checking, so mit_max_* below are the only protection.
     #
-    # Gains: bench session 2026-09-19 on motor 22 (gl40_mit_mode_explainer.md). kp is quantised
+    # Gains: bench session 2026-09-19 on motor 22. kp is quantised
     # to the drive's 12-bit code (500/4096 = 0.1221 N.m/rad per count), so 1.22 -> raw 10 ->
     # 1.2207 applied. kd must be non-zero: the GL II manual warns kd = 0 in position control
     # makes the motor oscillate and run away.
@@ -175,7 +175,7 @@ safety:
     # ceiling cannot do better. Gravity feed-forward barely helps here: the model's wrist load
     # peaks at 0.18 N.m, but the startup rule leaves only 0.3 - 0.256 = 0.044 N.m of headroom
     # at these gains (lower mit_kp to make room).
-    wrist:
+    wrist: #gl40 22
       pitch:
         velocity_max: 30.0
         delta_max: 2.4

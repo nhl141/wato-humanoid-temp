@@ -107,22 +107,10 @@ RUN old=$(getent passwd "${USER_UID}" | cut -d: -f1 || true); \
     id -u "${USERNAME}" >/dev/null 2>&1 || { \
         getent group "${USER_GID}" >/dev/null || groupadd --gid "${USER_GID}" "${USERNAME}"; \
         useradd --uid "${USER_UID}" --gid "${USER_GID}" -m "${USERNAME}" --shell /bin/bash; }; \
-    apt-get update && apt-get install -y --no-install-recommends sudo curl ca-certificates; \
+    apt-get update && apt-get install -y --no-install-recommends sudo; \
     echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/${USERNAME}"; \
     chmod 0440 "/etc/sudoers.d/${USERNAME}"; \
     chown -R "${USER_UID}:${USER_GID}" "${AMENT_WS}" "/home/${USERNAME}"; \
     rm -rf /var/lib/apt/lists/*
 USER ${USERNAME}
-
-# Oh My Bash for the interactive shell you get from `watod -t interfacing`: a prompt that shows
-# the git branch and whether the tree is dirty, which matters when the container is where you
-# edit configs and run bench scripts. Cosmetic only -- nothing here runs in the deploy image,
-# and the entrypoint is unaffected. Installed as ${USERNAME} so it lands in their real home
-# (~/.oh-my-bash + ~/.bashrc), not in the bind-mounted workspace.
-RUN curl -fsSL https://raw.githubusercontent.com/ohmybash/oh-my-bash/master/tools/install.sh \
-      -o /tmp/install-omb.sh \
-    && bash /tmp/install-omb.sh --unattended \
-    && sed -i 's/^OSH_THEME=.*/OSH_THEME="font"/' "/home/${USERNAME}/.bashrc" \
-    && rm -f /tmp/install-omb.sh
-
 WORKDIR ${AMENT_WS}

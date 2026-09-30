@@ -115,8 +115,7 @@ shoulder roll swings it **out to the side**, elbow pitch swings the forearm **ba
 (forward flexion is negative), wrist pitch swings the hand backward. Yaw and roll joints: compare
 against the URDF zero pose in sim.
 
-Step-by-step bench procedure (no URDF knowledge needed): [GRAVITY_TUNING.md](GRAVITY_TUNING.md).
-In short, one joint at a time, arm supported, `gravity_ff_scale` still 0:
+Bench procedure, one joint at a time, arm supported, `gravity_ff_scale` still 0:
 
 1. Offsets: put the arm in URDF zero. The seed log prints `prev_targets(cmd-frame deg)`; set
    `urdf_offset_deg = -urdf_direction * q_cmd` per joint. Redo after every recalibration.
@@ -181,9 +180,8 @@ the ordering fix.
 
 `colcon test --packages-select joint_command` runs gtests against the **shipped** config, so a
 change that disables the position clamp, raises a velocity past the 2 rad/s testing ceiling, or
-breaks the MIT gain rule fails the build rather than the arm. See
-[TESTING_LIMITS_AND_TELEMETRY.md](../TESTING_LIMITS_AND_TELEMETRY.md) for running them and for
-the on-hardware benchmarks.
+breaks the MIT gain rule fails the build rather than the arm. For on-hardware benchmarks see
+"Angle benchmarks through the teleop path" in [can/README.md](../can/README.md).
 
 ## Launch
 

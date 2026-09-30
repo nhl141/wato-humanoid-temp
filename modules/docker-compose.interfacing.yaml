@@ -27,8 +27,8 @@ services:
       - ${MONO_DIR}/src/interfacing:/root/ament_ws/src/interfacing
       # For calibrate_arm.py --write-mapping
       - ${MONO_DIR}/src/interfacing/joint_command/config/hardware_mapping.yaml:/calibration/hardware_mapping.yaml
-      # Telemetry run folders (gl40_mit_move.py / gl40_bench.py / telemetry_record.py write
-      # here; the host-side plotter reads them). outputs/ is gitignored.
+      # Telemetry run folders (telemetry_record.py writes here; the host-side plotter reads
+      # them). outputs/ is gitignored.
       - ${MONO_DIR}/outputs:/outputs
       # Read-only copy of the limits, so telemetry can record the ceilings it is judging
       # against (the writable single-file /calibration mount above is for calibrate_arm.py)

@@ -7,8 +7,7 @@ is separate (`pioneer_bimanual_arm/live_arm_mjviser.py`).
 > ⚠️ Moves real motors. Arm clear, hand on the E-stop. The position clamp is **enabled** and
 > `velocity_max` is 10°/s — and it is now a true deg/s bound, since moderation runs on the
 > control tick rather than per incoming message. A joint whose measured position is outside its
-> configured limits is excluded with an error rather than clamped; see
-> [TESTING_LIMITS_AND_TELEMETRY.md](../TESTING_LIMITS_AND_TELEMETRY.md).
+> configured limits is excluded with an error rather than clamped.
 
 Names below assume the `watod_hy-*` project and container `watod_hy-jc-dry`.
 
@@ -97,7 +96,7 @@ docker exec watod_hy-jc-dry bash -c 'pkill -f "install/joint_command/lib"'  # ar
 ## Notes
 - **Speed / smoothing:** edit `config/safety_limits.yaml` (`velocity_max`, `low_pass_alpha`,
   the `enable_*` flags), then rebuild (Setup) + restart the node. Currently 10°/s, clamp on.
-- **Telemetry:** `tools/gl40_ros_move.sh --pose "..."` does the publish + record + plot in one
+- **Telemetry:** `tools/arm_roundtrip.sh --offset "..."` does the move + record + plot in one
   command, writing `angle.png` / `velocity.png` into `outputs/gl40_bench/<run>/`.
 - **Wrist (motor 22)** runs MIT, not POSITION_LOOP: it has stiffness gains and a torque /
   tracking / feedback watchdog that frees it and latches on any fault.

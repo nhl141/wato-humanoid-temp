@@ -91,7 +91,7 @@ TEST(MitPacking, GainsSnapToNearestCode) {
   EXPECT_EQ(packMitGain(-5.0, p.kp_max, 12), 0u) << "negative gain clamps to zero";
 }
 
-// Captured from the real GL40 at CAN id 22 on 2026-09-19 (see gl40_mit_mode_explainer.md).
+// Captured from the real GL40 at CAN id 22 on 2026-09-19.
 TEST(MitDecode, DecodesBenchFeedbackCapture) {
   const uint8_t data[8] = {0x16, 0x99, 0x21, 0x7F, 0xE7, 0xFF, 0x28, 0x00};
   const auto fb = decodeGl2Feedback(data, gl40Profile());

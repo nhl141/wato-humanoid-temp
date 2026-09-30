@@ -41,7 +41,7 @@ python3 /root/ament_ws/src/interfacing/can/scripts/calibrate_arm.py \
 ```
 Prompt: **Enter**=yes · id=correct id · **s**=skip · **q**=quit.
 
-### GL40 II in MIT mode (`gl40_mit_move.py`, `gl40_bench.py`)
+### GL40 II in MIT mode
 
 The wrist (id 22) and gripper (id 21) GL40s use CubeMars' **GL II gimbal drive**, which in MIT
 mode speaks *standard* 11-bit frames (`ID = node id`, feedback on the master id, default
@@ -55,46 +55,14 @@ MIT feedback on the master id is decoded into `MotorFeedback` (with `torque`). G
 `MotorCmd.kp/kd` are snapped to the drive's nearest 12-bit code — truncating, as the manual's
 reference code does, would silently apply up to a full count less (kp 0.61 → 0.488).
 
-The raw-SocketCAN bench tools remain, for what the ROS path cannot do: step-response gain
-tuning, and the gripper (21), which has no `ArmPose` slot. Angle benchmarks belong on
-`arm_roundtrip.py` (below), which goes through the same `joint_command` as teleop.
-
-```bash
-S=/root/ament_ws/src/interfacing/can/scripts   # /root/ament_ws is root-only -> sudo
-sudo python3 $S/gl40_mit_move.py --selftest                 # packing vs the manual (no bus)
-sudo python3 $S/gl40_mit_move.py --id 22 --monitor          # zero torque; check the rad scale
-sudo python3 $S/gl40_mit_move.py --id 22 --deg 40 --dry-run # print frames only
-sudo python3 $S/gl40_mit_move.py --id 22 --deg 40 --hold    # out, hold until Ctrl-C, back
-sudo python3 $S/gl40_bench.py    --id 22 --step 5 --sweep "0.61,1.22,1.34"   # gain sweep
-```
-
-**Same limits as teleop.** Both tools load the files `joint_command` enforces:
-- `kp`/`kd`, `--max-torque` and `--max-track-err` default to the joint's `mit_*` block in
-  `safety_limits.yaml`.
-- `--max-setpoint-vel` defaults to its `velocity_max` (10 °/s).
-- `--soft-limits` defaults to its `hardware_mapping.yaml` range, converted to the drive frame.
-
-A flag may tighten any of these, never loosen it. A joint with no validated gains (the gripper)
-needs explicit `--kp`/`--kd`. AK ids are refused, because this is the GL II protocol only. A
-joint already outside its limits is refused too, as `joint_command` would exclude it.
-`--monitor` skips the limits, since it commands nothing. The one exception is the step in
-`gl40_bench.py`: it is the measurement, so it is bounded by `kp·step ≤ max_torque` and
-`step < max_track_err` instead of by `velocity_max`.
-
-It reads the position first, holds it, ramps the setpoint, settles, then **ramps back to where it
-started and only then frees the motor**, so a loaded joint is never dropped from the target.
-The first Ctrl-C returns to the start as well; a second one frees immediately. `--no-return`
-restores the old free-at-target behaviour. Safety aborts still free at once, because a drive that
-just faulted can't be trusted to servo back. They fire on torque, tracking error, shaft velocity
-> 3 rad/s, leaving `--soft-limits`, > 60 °C, a drive error, or 200 ms without feedback.
-`--clamp-target` clamps an out-of-range target instead of refusing it; that is how limit
-enforcement is demonstrated. Gains must satisfy `kp × max-track-err ≤ max-torque`: a stalled
-motor is the worst case, since the tracking abort caps the PD torque.
+Angle benchmarks go through `arm_roundtrip.py` (below), which uses the same `joint_command` as
+teleop. The gripper (21) has no `ArmPose` slot, so nothing drives it yet.
 
 **Gains, and where they live now.** The codebase is the source of truth:
 `joint_command/config/safety_limits.yaml` holds the per-joint `mit_kp`/`mit_kd` that
-`joint_command` sends through `MotorCmd`, and the node refuses to start if they violate the
-rule above. Bench result 2026-09-19 on id 22: kp 0.366 lagged > 15° and aborted; kp 0.49 held
+`joint_command` sends through `MotorCmd`, and the node refuses to start if they violate
+`kp × max_track_err ≤ max_torque` (a stalled motor is the worst case, since the tracking fault
+caps the PD torque). Bench result 2026-09-19 on id 22: kp 0.366 lagged > 15° and aborted; kp 0.49 held
 with a 6° sag; **kp 1.22 (raw 10) / kd 0.0098 (raw 8)** with a 12° abort limit moved +34° and
 held steady at 0.125 N·m — those are the shipped values. Expect a few degrees of steady-state
 sag under a gravity load: pure PD under a 0.3 N·m ceiling cannot do better, and there is little
@@ -144,8 +112,6 @@ in `MotorCmd.torque` closes that gap; see "Gravity feed-forward" in
 
 ### Angle benchmarks through the teleop path (`arm_roundtrip.py`)
 
-Step-by-step clamp test for every motor: [MIT_CLAMP_TEST.md](../MIT_CLAMP_TEST.md).
-
 `tools/arm_roundtrip.sh` runs `scripts/arm_roundtrip.py` in the `joint_command` container. It
 publishes `ArmPose` to `/arm/joint_targets` exactly as Quest / `task_space_ik` do, so every
 limit teleop runs under applies: the clamp, `velocity_max`, the low-pass, and the MIT gains and
@@ -193,8 +159,8 @@ Once the stream stops, `joint_command`'s stale handling applies, as it does when
 
 ### Telemetry and plots
 
-Every move — bench script or ROS pipeline — writes a **run folder** under `outputs/gl40_bench/`
-(gitignored; bind-mounted into the container at `/outputs`):
+Every `arm_roundtrip.py` / `telemetry_record.py` run writes a **run folder** under
+`outputs/gl40_bench/` (gitignored; bind-mounted into the container at `/outputs`):
 
 ```
 20260922-190024_id22mp40deg/
@@ -208,26 +174,8 @@ Logging is on by default and needs no flag (`--no-log` opts out). Plotting runs 
 the robot-control image has no matplotlib/numpy on purpose, so `uv` supplies them per run.
 
 ```bash
-tools/gl40_move.sh --id 22 --deg 40 --kp 1.22 --max-track-err 12   # move + plot, one command
 tools/arm_roundtrip.sh --joints wrist.pitch --offset "0,0,0,0,0,20" # out and back, joint_command
-tools/gl40_ros_move.sh --pose "0,0,0,0,0,20" --duration 15         # through joint_command
 uv run --with matplotlib --with numpy tools/gl40_telemetry_plot.py outputs/gl40_bench/<run>
-```
-
-Full procedure, including the clamp benchmarks and the no-hardware simulator:
-[TESTING_LIMITS_AND_TELEMETRY.md](../TESTING_LIMITS_AND_TELEMETRY.md).
-
-### No hardware? `gl40_sim.py`
-
-Emulates all seven drives on a virtual CAN bus — five AK in servo mode (or MIT with
-`--ak-mode mit`), two GL II in MIT mode,
-each with inertia, damping and a gravity-like load — so the whole pipeline can be exercised
-before anything is plugged in:
-
-```bash
-sudo ip link add dev vcan0 type vcan; sudo ip link set up vcan0   # once (NET_ADMIN)
-python3 $S/gl40_sim.py --iface vcan0
-ros2 launch can can.launch.py --ros-args -p can_interface:=vcan0 -p bustype:=socketcan
 ```
 
 ---

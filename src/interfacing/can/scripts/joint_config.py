@@ -3,10 +3,10 @@
 joint_command is the contract every way of moving the arm goes through: teleop (Quest,
 task_space_ik) and arm_roundtrip.py publish ArmPose to it, and it enforces the angle clamp from
 hardware_mapping.yaml and the velocity limit / MIT gains / MIT ceilings from safety_limits.yaml.
-The raw-SocketCAN bench tools (gl40_mit_move.py, gl40_bench.py) bypass joint_command, so they
-load the same two files through this module and may only tighten what they find.
+The scripts that check or record against those limits (arm_roundtrip.py, telemetry_record.py,
+calibrate_arm.py) load the same two files through this module.
 
-No ROS imports on purpose: the bench tools run under plain ``sudo python3`` with no ROS sourced.
+No ROS imports, so it stays usable from plain Python.
 
 Frames (see joint_command_core.cpp applyCalibration):
   command frame  degrees, what ArmPose carries and what the limits are written in

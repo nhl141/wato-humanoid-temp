@@ -235,7 +235,7 @@ def load_run(path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Analysis (stdlib only -- shared by gl40_bench.py --report and the host plotter)
+# Analysis (stdlib only -- shared by the recorders and the host plotter)
 # ---------------------------------------------------------------------------
 
 def split_by_motor(rows) -> Dict[int, list]:
@@ -307,7 +307,7 @@ def motor_metrics(rows, meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]
     temps = _finite([r["drive_c"] for r in rows])
 
     meas_vel = _finite(differentiate(t, pos))
-    # A step test jumps the setpoint on purpose (gl40_bench.py: bounded by torque, not by
+    # A step test jumps the setpoint on purpose (bounded by torque, not by
     # velocity_max), so the commanded trace is differentiated piecewise, cut where the "step"
     # phase begins. Every other discontinuity still counts against velocity_max.
     cuts = [0] + [i for i in range(1, len(rows))
