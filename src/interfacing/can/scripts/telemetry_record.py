@@ -42,7 +42,7 @@ from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 
 from common_msgs.msg import ArmPose, MotorCmd, MotorFeedback
 
-from joint_config import find_mapping, load_joint_map, load_safety_limits
+from joint_config import find_mapping, load_joint_map, load_safety_limits, max_torque_by_joint
 from telemetry import RunFolder
 
 # GL II status nibble (MIT feedback). Servo feedback uses the DBC's own error codes.
@@ -61,6 +61,7 @@ class TelemetryRecorder(Node):
         self.motors = motors
         self.rate_hz = rate_hz
         self.setpoints: Dict[int, float] = {}      # moderated, from MotorCmd
+        self.mit_cmd: Dict[int, tuple] = {}        # (feed-forward N.m, kp) of the last MIT frame
         self.requested: Dict[int, float] = {}      # raw, from ArmPose
         self.feedback: Dict[int, MotorFeedback] = {}
         self.seen: set = set()
@@ -103,8 +104,13 @@ class TelemetryRecorder(Node):
         if msg.control_type == 0 and msg.kp == 0.0:
             # No stiffness, so the position field means nothing: a zero-gain "poke", or a
             # damped fault/seeding frame (kd > 0 on an AK) -- neither is a setpoint.
+            self.mit_cmd.pop(motor_id, None)
             return
         self.setpoints[motor_id] = zero + deg / direction
+        if msg.control_type == 0:
+            self.mit_cmd[motor_id] = (float(msg.torque), float(msg.kp))
+        else:
+            self.mit_cmd.pop(motor_id, None)
 
     def _on_feedback(self, msg: MotorFeedback) -> None:
         self.feedback[int(msg.motor_id)] = msg
@@ -136,6 +142,8 @@ class TelemetryRecorder(Node):
                 current_a=current if current else None,
                 drive_c=int(fb.temperature),
                 status=status,
+                ff_nm=self.mit_cmd.get(motor_id, (None, None))[0],
+                kp=self.mit_cmd.get(motor_id, (None, None))[1],
             )
             self.rows += 1
 
@@ -183,6 +191,7 @@ def main(argv=None) -> int:
                 "mit": mit_limits,
                 "max_torque_nm": min((v["max_torque_nm"] for v in mit_limits.values()
                                       if v.get("max_torque_nm") is not None), default=None),
+                "max_torque_nm_by_joint": max_torque_by_joint(args.safety_limits),
                 "max_track_err_deg": min((v["max_track_err_deg"] for v in mit_limits.values()
                                           if v.get("max_track_err_deg") is not None),
                                          default=None),

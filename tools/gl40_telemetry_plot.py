@@ -333,8 +333,19 @@ def plot_run(run_dir: Path) -> List[Path]:
                 ys = [r["tau_nm"] for r in mrows]
                 ax.plot(xs, ys, color=colour, linewidth=LINE_W, label=joint, zorder=4)
                 label_end(ax, xs, ys, joint, colour)
-            ceiling_nm = (meta.get("limits", {}) or {}).get("max_torque_nm")
-            if ceiling_nm is not None:
+            limits = meta.get("limits", {}) or {}
+            by_joint = limits.get("max_torque_nm_by_joint") or {}
+            plotted = {r["joint"] for r in rows if r["tau_nm"] is not None and r["joint"]}
+            joints = [j for j in (meta.get("moving") or sorted(plotted)) if j in by_joint]
+            if joints:
+                # Each joint against its own ceiling; one line per distinct value.
+                ceilings: Dict[float, List[str]] = {}
+                for j in joints:
+                    ceilings.setdefault(float(by_joint[j]), []).append(j)
+                for value, names in sorted(ceilings.items()):
+                    limit_lines(ax, -value, value, f"{', '.join(names)} ceiling")
+            elif limits.get("max_torque_nm") is not None:
+                ceiling_nm = limits["max_torque_nm"]
                 limit_lines(ax, -ceiling_nm, ceiling_nm, "torque ceiling")
             ax.legend(loc="upper left", frameon=False, fontsize=8, labelcolor=INK_SECONDARY,
                       ncol=min(3, len(motors)))

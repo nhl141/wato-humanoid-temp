@@ -56,6 +56,29 @@ std::array<uint8_t, 8> packMitCommand(double p, double v, double kp, double kd, 
   }};
 }
 
+uint32_t akMitCanId(int drive_id) {
+  return (8u << 8) | (static_cast<uint32_t>(drive_id) & 0xFFu);
+}
+
+std::array<uint8_t, 8> packAkMitCommand(double p, double v, double kp, double kd, double t,
+                                        const MitProfile& profile) {
+  const uint32_t p_i = packMitValue(p, profile.p_min, profile.p_max, 16);
+  const uint32_t v_i = packMitValue(v, profile.v_min, profile.v_max, 12);
+  const uint32_t kp_i = packMitGain(kp, profile.kp_max, 12);
+  const uint32_t kd_i = packMitGain(kd, profile.kd_max, 12);
+  const uint32_t t_i = packMitValue(t, profile.t_min, profile.t_max, 12);
+  return {{
+      static_cast<uint8_t>((kp_i >> 4) & 0xFF),
+      static_cast<uint8_t>(((kp_i & 0xF) << 4) | ((kd_i >> 8) & 0xF)),
+      static_cast<uint8_t>(kd_i & 0xFF),
+      static_cast<uint8_t>((p_i >> 8) & 0xFF),
+      static_cast<uint8_t>(p_i & 0xFF),
+      static_cast<uint8_t>((v_i >> 4) & 0xFF),
+      static_cast<uint8_t>(((v_i & 0xF) << 4) | ((t_i >> 8) & 0xF)),
+      static_cast<uint8_t>(t_i & 0xFF),
+  }};
+}
+
 MitFeedback decodeGl2Feedback(const uint8_t* data, const MitProfile& profile) {
   MitFeedback fb;
   if (data == nullptr) {

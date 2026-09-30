@@ -1,4 +1,3 @@
-#!/usr/bin/env bash
 # Angle benchmark through the teleop path: ramp out to a pose, dwell, ramp back, then plot.
 #
 # Runs src/interfacing/can/scripts/arm_roundtrip.py inside the joint_command container. It

@@ -170,6 +170,84 @@ TEST(MitSpecialFrames, MatchTheManualsMagicBytes) {
   EXPECT_EQ(mitSpecialFrame(MIT_SPECIAL_CLEAR_ERR)[7], 0xFB);
 }
 
+namespace {
+
+// The drive in the AK manual V3.0.1 CAN examples (id 0x68): its frames only decode to the
+// labelled values with p +-12.5 rad and v +-50 rad/s.
+MitProfile akManualExampleProfile() {
+  MitProfile p = ak809Profile();
+  p.p_min = -12.5;
+  p.p_max = 12.5;
+  p.v_min = -50.0;
+  p.v_max = 50.0;
+  p.kp_max = 500.0;
+  p.kd_max = 5.0;
+  return p;
+}
+
+struct AkFields {
+  uint32_t kp, kd, p, v, t;
+};
+
+AkFields akFields(const std::array<uint8_t, 8>& b) {
+  return {(static_cast<uint32_t>(b[0]) << 4) | (b[1] >> 4),
+          (static_cast<uint32_t>(b[1] & 0xF) << 8) | b[2],
+          (static_cast<uint32_t>(b[3]) << 8) | b[4],
+          (static_cast<uint32_t>(b[5]) << 4) | (b[6] >> 4),
+          (static_cast<uint32_t>(b[6] & 0xF) << 8) | b[7]};
+}
+
+// The manual centres zero at 0x7FF/0x7FFF, float_to_uint at 0x800/0x8000 -- both ~0.
+void expectWithinOneCount(uint32_t got, uint32_t want, const char* field) {
+  EXPECT_LE(got > want ? got - want : want - got, 1u)
+      << field << " got " << got << " want " << want;
+}
+
+} // namespace
+
+TEST(AkMit, CanIdIsExtendedControlMode8) {
+  EXPECT_EQ(akMitCanId(0x68), 0x868u) << "manual example id 00 00 08 68";
+  EXPECT_EQ(akMitCanId(14), 0x80Eu) << "shoulder pitch";
+  EXPECT_EQ(akMitCanId(0x1FF), 0x8FFu) << "drive id is only 8 bits";
+}
+
+// AK manual V3.0.1 p.53 "MIT Position Loop": Kp 2, Kd 2, rotate to 6 rad.
+TEST(AkMit, PackingMatchesManualPositionExample) {
+  const std::array<uint8_t, 8> manual{{0x01, 0x06, 0x66, 0xBD, 0x70, 0x7F, 0xF7, 0xFF}};
+  const auto got = packAkMitCommand(6.0, 0.0, 2.0, 2.0, 0.0, akManualExampleProfile());
+
+  for (int i = 0; i < 5; ++i) {
+    EXPECT_EQ(got[i], manual[i]) << "byte " << i << " (kp / kd / position)";
+  }
+  const AkFields g = akFields(got), m = akFields(manual);
+  expectWithinOneCount(g.v, m.v, "velocity");
+  expectWithinOneCount(g.t, m.t, "torque");
+}
+
+// AK manual V3.0.1 p.52 "MIT Velocity Loop": Kd 2, speed 6 rad/s.
+TEST(AkMit, PackingMatchesManualVelocityExample) {
+  const std::array<uint8_t, 8> manual{{0x00, 0x06, 0x66, 0x7F, 0xFF, 0x8F, 0x57, 0xFF}};
+  const AkFields g = akFields(packAkMitCommand(0.0, 6.0, 0.0, 2.0, 0.0, akManualExampleProfile()));
+  const AkFields m = akFields(manual);
+
+  EXPECT_EQ(g.kp, m.kp);
+  EXPECT_EQ(g.kd, m.kd);
+  EXPECT_EQ(g.v, m.v) << "6 rad/s";
+  expectWithinOneCount(g.p, m.p, "position");
+  expectWithinOneCount(g.t, m.t, "torque");
+}
+
+// Same fields, different order: collapsing the two packers would send AK position bits as
+// kp/kd (or GL II gains as position).
+TEST(AkMit, LayoutDiffersFromGl2) {
+  const auto p = akManualExampleProfile();
+  const auto ak = packAkMitCommand(6.0, 0.0, 2.0, 2.0, 0.0, p);
+  const auto gl = packMitCommand(6.0, 0.0, 2.0, 2.0, 0.0, p);
+  EXPECT_NE(ak, gl);
+  EXPECT_EQ(ak[3], gl[0]) << "AK position high byte sits where GL II puts it first";
+  EXPECT_EQ(ak[4], gl[1]);
+}
+
 TEST(MitProfileParsing, KnowsBothFamilies) {
   MitFamily f{};
   EXPECT_TRUE(mitFamilyFromString("ak", f));

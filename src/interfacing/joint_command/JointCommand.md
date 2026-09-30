@@ -81,6 +81,58 @@ the context is already invalid and `publish()` silently drops messages. The earl
 free never reached the bus. It still needs `can_node` alive to forward the frames, so stop
 `joint_command` **before** `can_node`, and keep a loaded arm supported.
 
+## Gravity feed-forward (MIT joints)
+
+Pure PD sags by about $\tau_{\mathrm{grav}} / k_p$. Each MIT joint can instead be sent the torque
+that holds the arm's weight, in `MotorCmd.torque`:
+
+$$\tau_{\mathrm{ff},i} = \mathrm{clip}\big(\texttt{gravity\_ff\_scale}_i \cdot r \cdot \tau_{\mathrm{model},i},\ \pm\texttt{gravity\_ff\_max\_torque}_i\big)$$
+
+- $\tau_{\mathrm{model}}$ ([gravity_model.cpp](src/gravity_model.cpp)) is the static load of the
+  **left** arm from the URDF's CAD masses/COMs (`joint1L..joint6l`, 2.78 kg; fingers lumped into
+  the last link), at this tick's commanded pose. For joint $i$:
+  $\tau_i = -\hat z_i \cdot \sum_{j \ge i} (c_j - p_i) \times m_j \vec g$, with joint position
+  $p_i$, world axis $\hat z_i$, link COM $c_j$ from forward kinematics.
+- It is converted to the motor frame through both sign flips: `direction` · `urdf_direction`.
+- $r$ ramps 0 → 1 over 1 s after every seed. The model is zeroed while any joint is blocked
+  (an unknown angle makes every joint's load unknown). Exception, for single-motor testing: an
+  **unpowered** joint with `gravity_assume_deg` set (cmd frame) stands in at that angle, and the
+  node WARNs at every seed. Strap the limp joint at that angle; left free it hangs with gravity,
+  not at a constant. A joint excluded for being out of range is never assumed.
+- Startup rule becomes: quantised `mit_kp` × `mit_max_track_err` + `gravity_ff_max_torque` ≤
+  `mit_max_torque`. `gravity_ff_scale` > 0 on a non-MIT joint or `arm_side` ≠ left is refused.
+
+Model worst cases over the URDF limits: shoulder pitch/roll 4.7 N·m, shoulder yaw/elbow pitch
+1.2 N·m, elbow roll/wrist 0.18 N·m. The GL40 wrist's shipped gains leave only 0.044 N·m of
+headroom under its 0.3 N·m ceiling, so it gains almost nothing from feed-forward.
+
+**The model needs URDF angles, and the cmd frame is not the URDF frame.** Cmd-frame 0 is
+wherever `calibrate_arm.py`'s home pose was. Each joint (all six, since a shoulder's load
+depends on the elbow) maps as `q_urdf = urdf_direction * q_cmd + urdf_offset_deg`. The shipped
+`1` / `0` are unverified guesses. URDF zero = every joint 0: arm hanging straight down, elbow
+straight. Positive URDF directions from that pose: shoulder pitch swings the arm **forward**,
+shoulder roll swings it **out to the side**, elbow pitch swings the forearm **backward**
+(forward flexion is negative), wrist pitch swings the hand backward. Yaw and roll joints: compare
+against the URDF zero pose in sim.
+
+Step-by-step bench procedure (no URDF knowledge needed): [GRAVITY_TUNING.md](GRAVITY_TUNING.md).
+In short, one joint at a time, arm supported, `gravity_ff_scale` still 0:
+
+1. Offsets: put the arm in URDF zero. The seed log prints `prev_targets(cmd-frame deg)`; set
+   `urdf_offset_deg = -urdf_direction * q_cmd` per joint. Redo after every recalibration.
+2. Directions: jog each joint a few degrees positive in the cmd frame and compare with the list
+   above.
+3. Check: the node logs `Gravity model, motor frame N.m: ... pred X meas Y` every 5 s. Hold a
+   few poses (shoulder pitch 30–60° forward, forearm horizontal). `pred` and `meas` must agree
+   in **sign** and roughly in size (meas includes friction). On POSITION_LOOP AK joints `meas`
+   is only non-zero once the motor has a `kt` in `can/config/mit_profiles.yaml`.
+4. Enable: set `gravity_ff_scale: 0.5` on the joint (it must be `control_type: 0`), confirm the
+   sag shrinks, then go to 1.0. If `pred` is consistently off by a factor k (CAD mass error), use
+   `gravity_ff_scale ≈ k` (limit 2).
+
+A wrong sign doubles the sag instead of cancelling it. The startup rule bounds that case,
+and the tracking watchdog faults on it.
+
 ## Joints found outside their own limits
 
 If seeding shows a joint physically outside its configured limits, its calibration and the

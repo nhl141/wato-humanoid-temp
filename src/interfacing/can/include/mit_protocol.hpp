@@ -3,11 +3,16 @@
 // CubeMars MIT ("Force Control") protocol helpers -- pure functions, no ROS, so they can be
 // unit-tested without a bus (see test/test_mit_protocol.cpp).
 //
-// Two dialects share this frame format:
-//   AK-series manual V3.2.0 section 4.2  (family "ak")
-//   GL II gimbal drive manual V1.0 section 5 (family "gl2" -- the GL40 KV70 wrist/gripper)
+// Two dialects:
+//   GL II gimbal drive manual V1.0 section 5 (family "gl2" -- the GL40 KV70 wrist/gripper):
+//     standard 11-bit frame on the motor id, payload below (packMitCommand), and needs the
+//     FF..FC ENTER special frame before it accepts commands.
+//   AK-series V3.0 firmware, manual V3.0.1 section 4.2 (family "ak"): EXTENDED frame on
+//     akMitCanId() = (8 << 8) | id, a DIFFERENT byte order (packAkMitCommand), no special
+//     frames and no mode switch. Feedback is the ordinary servo status frame (current, not
+//     torque), decoded through the DBC -- decodeAkFeedback() below does not apply to V3.
 //
-// Command payload (both dialects), 8 bytes:
+// GL II command payload, 8 bytes:
 //   byte 0: p[15:8]   byte 1: p[7:0]
 //   byte 2: v[11:4]   byte 3: v[3:0]<<4 | kp[11:8]
 //   byte 4: kp[7:0]   byte 5: kd[11:4]
@@ -20,7 +25,8 @@
 //   byte4[3:0] + byte 5: torque(12)
 //   byte 6: drive temp (degC, signed)   byte 7: motor temp (degC, signed)
 //
-// AK feedback payload (manual V3.2.0 section 4.2), on the master id:
+// Classic-MIT AK feedback payload, on the master id. NOT what V3.0 firmware sends (it replies
+// with the servo status frame); kept for pre-V3 drives:
 //   byte 0: driver id (FULL 8 bits -- unlike GL II, no status nibble)
 //   byte 1-2: position(16)   byte 3 + byte4[7:4]: velocity(12)
 //   byte4[3:0] + byte 5: torque(12)
@@ -52,6 +58,7 @@ struct MitProfile {
   double kd_min{0.0}, kd_max{5.0};
   MitFamily family{MitFamily::Gl2};
   std::string model{};
+  double kt{0.0}; // N.m/A at the output (ak only); 0 = unknown, torque not reported
 };
 
 // Decoded GL II feedback frame, in physical units.
@@ -91,9 +98,19 @@ uint32_t packMitGain(double phys, double max, unsigned bits);
 // actually applies for a given code.
 double unpackMitValue(uint32_t code, double min, double max, unsigned bits);
 
-// Payload for a MIT command frame, in the byte order documented above.
+// Payload for a GL II MIT command frame, in the byte order documented above.
 std::array<uint8_t, 8> packMitCommand(double p, double v, double kp, double kd, double t,
                                       const MitProfile& profile);
+
+// AK V3 MIT frame id (extended): control mode 8 in bits 28..8, driver id in bits 7..0.
+uint32_t akMitCanId(int drive_id);
+
+// AK V3 MIT payload (manual V3.0.1 p.38), same field widths as GL II but KP-first:
+//   byte 0: kp[11:4]   byte 1: kp[3:0]<<4 | kd[11:8]   byte 2: kd[7:0]
+//   byte 3: p[15:8]    byte 4: p[7:0]
+//   byte 5: v[11:4]    byte 6: v[3:0]<<4 | t[11:8]     byte 7: t[7:0]
+std::array<uint8_t, 8> packAkMitCommand(double p, double v, double kp, double kd, double t,
+                                        const MitProfile& profile);
 
 // GL II feedback -> physical units. `data` must hold at least 8 bytes.
 MitFeedback decodeGl2Feedback(const uint8_t* data, const MitProfile& profile);

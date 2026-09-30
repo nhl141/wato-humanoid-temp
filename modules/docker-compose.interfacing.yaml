@@ -33,6 +33,12 @@ services:
       # Read-only copy of the limits, so telemetry can record the ceilings it is judging
       # against (the writable single-file /calibration mount above is for calibrate_arm.py)
       - ${MONO_DIR}/src/interfacing/joint_command/config:/opt/joint_command_config:ro
+      # can_node loads its INSTALLED share/config, baked in at image build. Overlay the repo
+      # copies so a mit_profiles.yaml / params.yaml edit takes effect on the next container
+      # restart. Per file, not the directory: the installed dir also holds humanoid.dbc (copied
+      # from src/interfacing/dbc), which a directory mount would hide.
+      - ${MONO_DIR}/src/interfacing/can/config/mit_profiles.yaml:/opt/watonomous/can/share/can/config/mit_profiles.yaml:ro
+      - ${MONO_DIR}/src/interfacing/can/config/params.yaml:/opt/watonomous/can/share/can/config/params.yaml:ro
 
   joint_command:
     build:

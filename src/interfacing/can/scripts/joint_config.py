@@ -54,7 +54,9 @@ MIT_PROFILES = [
 # JointCommandCore::loadJointSafetyConfig does.
 _SAFETY_KEYS = ("velocity_max", "delta_max", "control_type", "mit_kp", "mit_kd",
                 "mit_max_torque", "mit_max_track_err", "mit_feedback_timeout", "mit_family",
-                "mit_fault_kd", "enable_position_clamp", "enable_velocity_limit")
+                "mit_fault_kd", "enable_position_clamp", "enable_velocity_limit",
+                "gravity_ff_scale", "gravity_ff_max_torque", "urdf_direction", "urdf_offset_deg",
+                "gravity_assume_deg")
 
 
 def _first_existing(candidates: List[str]) -> Optional[Path]:
@@ -184,6 +186,13 @@ def load_safety_limits(explicit: Optional[str]):
                 "max_track_err_deg": block.get("mit_max_track_err"),
             }
     return vmax, mit
+
+
+def max_torque_by_joint(explicit: Optional[str]) -> Dict[str, float]:
+    """Every joint's mit_max_torque, MIT or not -- the testing ceiling a run is judged against."""
+    _, joints = load_joint_safety(find_safety_limits(explicit))
+    return {name: float(block["mit_max_torque"]) for name, block in joints.items()
+            if block.get("mit_max_torque") is not None}
 
 
 def motor_to_cmd_deg(info: dict, motor_deg: float) -> float:

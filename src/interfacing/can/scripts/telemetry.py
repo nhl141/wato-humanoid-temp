@@ -57,6 +57,8 @@ CSV_FIELDS = [
     "drive_c",
     "motor_c",
     "status",
+    "ff_nm",
+    "kp",
 ]
 
 #: Container mount point for the repo's gitignored outputs/ directory (see
@@ -150,7 +152,8 @@ class RunFolder:
     # -- writing ---------------------------------------------------------
     def row(self, motor_id: int, phase: str, joint: str = "", sp_deg=None, pos_deg=None,
             vel_dps=None, tau_nm=None, current_a=None, drive_c=None, motor_c=None,
-            status=None, t_s: Optional[float] = None, sp_raw_deg=None) -> None:
+            status=None, t_s: Optional[float] = None, sp_raw_deg=None, ff_nm=None,
+            kp=None) -> None:
         if not self.enabled or self._writer is None:
             return
 
@@ -172,6 +175,8 @@ class RunFolder:
             "drive_c": "" if drive_c is None else int(drive_c),
             "motor_c": "" if motor_c is None else int(motor_c),
             "status": "" if status is None else status,
+            "ff_nm": num(ff_nm, 5),
+            "kp": num(kp),
         })
         self._rows += 1
         if self._rows % 50 == 0:
@@ -221,7 +226,7 @@ def load_run(path: Path):
         for raw in csv.DictReader(f):
             row = dict(raw)
             for key in ("t_s", "sp_deg", "sp_raw_deg", "pos_deg", "vel_dps", "tau_nm",
-                        "current_a"):
+                        "current_a", "ff_nm", "kp"):
                 row[key] = float(raw[key]) if raw.get(key) not in (None, "") else None
             for key in ("motor_id", "drive_c", "motor_c"):
                 row[key] = int(raw[key]) if raw.get(key) not in (None, "") else None
@@ -400,7 +405,9 @@ def motor_metrics(rows, meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]
 
     # Pass/fail against whatever limits the run recorded.
     checks = []
-    max_torque = limits.get("max_torque_nm")
+    # This joint's own ceiling; the scalar (min over all MIT joints) is for pre-per-joint runs.
+    joint = next((r.get("joint") for r in rows if r.get("joint")), None)
+    max_torque = (limits.get("max_torque_nm_by_joint") or {}).get(joint, limits.get("max_torque_nm"))
     if max_torque is not None:
         checks.append(("peak torque <= max_torque",
                        m["peak_torque_nm"] <= max_torque + 1e-9,

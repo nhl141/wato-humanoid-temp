@@ -232,6 +232,17 @@ void CanNode::motorCMDCallback(const common_msgs::msg::MotorCmd::SharedPtr msg) 
         return;
       }
       const MitProfile& p = it->second;
+      if (p.family == MitFamily::Ak) {
+        // AK V3: extended id 0x800|id, KP-first payload. Sending the GL II layout here would
+        // put position bits into kp/kd.
+        CanMessage ak_msg(static_cast<int>(akMitCanId(msg->motor_id)), 8);
+        ak_msg.is_extended_id = true;
+        const auto payload =
+            packAkMitCommand(msg->position, msg->velocity, msg->kp, msg->kd, msg->torque, p);
+        std::copy(payload.begin(), payload.end(), ak_msg.data.begin());
+        publishCanMessage(ak_msg);
+        break;
+      }
       dbc_msg = can_messages["MITControlCmd"];
       CanMessage can_msg(getMessageId(dbc_msg, msg->motor_id), dbc_msg->MessageSize());
       // Gains use packMitGain (nearest code): truncation always rounds a gain DOWN, and one
@@ -337,6 +348,7 @@ void CanNode::loadMitProfiles() {
     p.kd_min = n["kd_min"].as<double>();
     p.kd_max = n["kd_max"].as<double>();
     p.model = n["model"] ? n["model"].as<std::string>() : std::string("?");
+    p.kt = n["kt"] ? n["kt"].as<double>() : 0.0;
     const std::string family = n["family"] ? n["family"].as<std::string>() : std::string("ak");
     if (!mitFamilyFromString(family, p.family)) {
       RCLCPP_ERROR(this->get_logger(),
@@ -344,6 +356,12 @@ void CanNode::loadMitProfiles() {
                    "skipping this motor; MIT_CONTROL for it will be refused.",
                    motor_id, family.c_str());
       continue;
+    }
+    if (p.family == MitFamily::Ak && p.kt <= 0.0) {
+      RCLCPP_WARN(this->get_logger(),
+                  "AK motor %d has no 'kt' in mit_profiles.yaml: its feedback torque stays 0, so "
+                  "joint_command's mit_max_torque can never trip for it in MIT mode.",
+                  motor_id);
     }
     mit_profiles_[motor_id] = p;
     RCLCPP_INFO(this->get_logger(), "Loaded MIT profile for motor %d (%s, family %s)", motor_id,
@@ -398,6 +416,21 @@ void CanNode::sendMitSpecialFrame(int motor_id, uint8_t code, const char* what) 
                  "MIT special frame (%s) requested for motor %d with no MIT profile loaded "
                  "(see config/mit_profiles.yaml) -- refusing.",
                  what, motor_id);
+    return;
+  }
+  if (it->second.family == MitFamily::Ak) {
+    // AK V3 has no special frames; FF..FE on its id is not a documented command.
+    if (code == MIT_SPECIAL_SET_ZERO) {
+      RCLCPP_ERROR(this->get_logger(),
+                   "MIT set zero refused for AK motor %d: V3 firmware has no MIT zero frame. "
+                   "Use SET_ORIGIN (servo mode 5) with the joint in its known zero pose.",
+                   motor_id);
+    } else {
+      RCLCPP_INFO_ONCE(this->get_logger(),
+                       "MIT %s not sent to AK motor %d: V3 firmware accepts MIT frames directly "
+                       "(logged once)",
+                       what, motor_id);
+    }
     return;
   }
   // Standard 11-bit frame addressed by node id, exactly like a MIT command frame.
@@ -536,7 +569,14 @@ void CanNode::receiveCanMessages() {
             decodeSignalPhysical(findSignalByName(dbc_msg, "FbkSpeed"), message.data.data()));
         feedback_msg.current = static_cast<float>(
             decodeSignalPhysical(findSignalByName(dbc_msg, "FbkCurrent"), message.data.data()));
-        feedback_msg.torque = 0.0f; // servo-mode feedback carries current, not torque
+        // Servo status carries current, not torque. AK V3 drives report through this frame in
+        // MIT mode too, so derive torque for them -- joint_command's mit_max_torque reads it.
+        feedback_msg.torque = 0.0f;
+        const auto prof = mit_profiles_.find(device_id);
+        if (prof != mit_profiles_.end() && prof->second.family == MitFamily::Ak &&
+            prof->second.kt > 0.0) {
+          feedback_msg.torque = static_cast<float>(feedback_msg.current * prof->second.kt);
+        }
         feedback_msg.temperature = static_cast<int8_t>(
             decodeSignalPhysical(findSignalByName(dbc_msg, "FbkTemperature"), message.data.data()));
         feedback_msg.error_code = static_cast<int8_t>(

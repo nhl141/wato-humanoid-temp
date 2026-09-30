@@ -260,6 +260,7 @@ def main(argv=None) -> int:
                 "mit": mit_limits,
                 "max_torque_nm": min((v["max_torque_nm"] for v in mit_limits.values()
                                       if v.get("max_torque_nm") is not None), default=None),
+                "max_torque_nm_by_joint": jc.max_torque_by_joint(str(safety_path)),
                 "max_track_err_deg": args.max_track_err,
             },
         },

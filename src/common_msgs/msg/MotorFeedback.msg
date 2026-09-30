@@ -7,8 +7,8 @@ float32 position
 float32 velocity
 float32 current
 
-# MIT mode only (N.m, decoded from the drive's 12-bit torque field). 0 for servo-mode
-# feedback, which reports current instead.
+# N.m. GL II MIT: decoded from the drive's 12-bit torque field. AK (servo status frame, which
+# V3 drives also send in MIT mode): current * kt from mit_profiles.yaml. 0 otherwise.
 float32 torque
 
 int8 temperature

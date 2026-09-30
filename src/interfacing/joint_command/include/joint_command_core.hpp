@@ -61,6 +61,19 @@ struct JointSafetyConfig {
   MitFaultAction mit_fault_action{MitFaultAction::Limp};
   bool mit_fault_action_explicit{false};
   double mit_fault_kd{0.0}; // N.m.s/rad, used by Damp; must be > 0 when Damp is in effect
+
+  // Gravity feed-forward (MIT joints only), sent as MotorCmd.torque. scale 0 = off; the model
+  // still runs so its prediction can be compared with measured torque before enabling it.
+  double gravity_ff_scale{0.0};
+  double gravity_ff_max_torque{0.0}; // N.m, |feed-forward| is clamped to this
+  // ArmPose cmd frame -> URDF frame for the gravity model: q_urdf = urdf_direction * q_cmd +
+  // urdf_offset_deg. Needed on EVERY joint (a shoulder's load depends on the elbow angle).
+  int urdf_direction{1};
+  double urdf_offset_deg{0.0};
+  // Cmd-frame angle the gravity model uses while this joint is UNPOWERED (no feedback at the
+  // seed). Unset = an unpowered joint zeroes all feed-forward. Only valid while the limp joint
+  // is strapped at that angle -- left free it follows gravity, not a constant.
+  std::optional<double> gravity_assume_deg;
 };
 
 // One motor's latest feedback, as the MIT watchdog needs it. Kept ROS-free so the checks are
@@ -122,6 +135,7 @@ public:
   // excluded from further commands (MIT ones are held limp) until the mapping is fixed.
   void blockJoints(const std::vector<size_t>& indices);
   bool isBlocked(size_t joint) const;
+  bool isUnpowered(size_t joint) const;
 
   // MIT watchdog. Returns a human-readable fault, or nullopt when every MIT joint is healthy.
   std::optional<std::string>
@@ -140,6 +154,12 @@ public:
   // feedback comes back in, so tracking error is a straight subtraction.
   const std::vector<double>& lastMotorCmdDeg() const {
     return last_motor_cmd_deg_;
+  }
+
+  // Gravity model's holding torque for the last commanded pose, MOTOR frame (N.m), before
+  // scale/clamp/ramp -- compare with measured feedback torque. Zero while any joint is blocked.
+  const std::vector<double>& lastGravityTorqueMotor() const {
+    return last_gravity_torque_motor_;
   }
 
   size_t jointCount() const {
@@ -169,6 +189,7 @@ private:
   static double applyLowPass(double target, double previous, double alpha);
   bool validateMitGains();
   common_msgs::msg::MotorCmd mitSafeCommand(size_t joint) const;
+  std::vector<double> gravityTorqueMotor(const std::vector<double>& cmd_targets_deg) const;
 
   std::vector<JointConfig> joints_;
   std::vector<JointSafetyConfig> safety_;
@@ -176,6 +197,10 @@ private:
   std::vector<double> last_motor_cmd_deg_;
   std::vector<bool> blocked_;
   std::vector<bool> unpowered_; // no feedback at the last seed; recomputed every seed
+  std::vector<double> last_gravity_torque_motor_;
+  // 0 -> 1 over kGravityFfRampSec after every seed, so feed-forward never steps onto a joint.
+  double gravity_ff_ramp_{0.0};
+  std::string arm_side_;
   bool have_prev_targets_{false};
   double control_rate_hz_{50.0};
   std::string last_error_;
