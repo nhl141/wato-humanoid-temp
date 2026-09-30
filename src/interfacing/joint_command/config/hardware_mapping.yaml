@@ -2,10 +2,10 @@ left:
   shoulder:
     pitch:
       can_id: 14
-      lower_limit: -89.9000015258789
-      upper_limit: 88.0999984741211
+      lower_limit: -77.00000381469727
+      upper_limit: 85.79999923706055
       direction: 1
-      zero_offset: 30.0
+      zero_offset: 34.29999923706055
       limit_range: true
     roll:
       can_id: 13

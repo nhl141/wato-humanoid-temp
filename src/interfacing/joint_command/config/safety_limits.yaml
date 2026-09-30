@@ -85,74 +85,74 @@ safety:
       pitch:   # AK10-9, id 14 -- most gravity load, bring up LAST
         velocity_max: 30.0
         delta_max: 2.0
-        # control_type: 0
-        # mit_family: ak
-        # mit_kp: 15.0           # -> 15.01 applied; x 0.2094 rad = 3.14 N.m <= 10
-        # mit_kd: 0.8
-        # mit_max_torque: 10.0
-        # mit_fault_kd: 1.0
-        # gravity_ff_max_torque: 5.5   # model max 4.7 N.m (arm straight out); 3.14 + 5.5 <= 10
-        # urdf_direction: 1            
-        # urdf_offset_deg: 0.0         
+        control_type: 0
+        mit_family: ak
+        mit_kp: 55.0           # -> 15.01 applied; x 0.2094 rad = 3.14 N.m <= 10
+        mit_kd: 0.8
+        mit_max_torque: 54.0
+        mit_fault_kd: 1.0
+        gravity_ff_max_torque: 10.5   # model max 4.7 N.m (arm straight out); 3.14 + 5.5 <= 10
+        urdf_direction: 1            
+        urdf_offset_deg: 0.0         
 
         gravity_assume_deg: 0.0
       roll:    # AK10-9, id 12
         velocity_max: 30.0
         delta_max: 2.0
-        # control_type: 0
-        # mit_family: ak
-        # mit_kp: 15.0
-        # mit_kd: 0.8
-        # mit_max_torque: 10.0
-        # mit_fault_kd: 1.0
-        # gravity_ff_max_torque: 5.5   # model max 4.7 N.m
-        # urdf_direction: 1            
-        # urdf_offset_deg: 0.0         
-        # gravity_assume_deg: 0.0
+        control_type: 0
+        mit_family: ak
+        mit_kp: 15.0
+        mit_kd: 0.8
+        mit_max_torque: 54.0
+        mit_fault_kd: 1.0
+        gravity_ff_max_torque: 5.5   # model max 4.7 N.m
+        urdf_direction: 1            
+        urdf_offset_deg: 0.0         
+        gravity_assume_deg: 0.0
       yaw:     # AK80-9, id 11
         velocity_max: 60.0
         delta_max: 2.0
-        # control_type: 0
-        # mit_family: ak
-        # mit_kp: 8.0            # -> 8.06 applied; x 0.2094 rad = 1.69 N.m <= 5
-        # mit_kd: 0.4
-        # mit_max_torque: 5.0
-        # mit_fault_kd: 0.5
-        # gravity_ff_max_torque: 1.5   # model max 1.2 N.m; 1.69 + 1.5 <= 5
-        # urdf_direction: 1            #
-        # urdf_offset_deg: 0.0         
-        # gravity_assume_deg: 0.0
+        control_type: 0
+        mit_family: ak
+        mit_kp: 60.0            # -> 8.06 applied; x 0.2094 rad = 1.69 N.m <= 5
+        mit_kd: 0.4
+        mit_max_torque: 18.0
+        mit_fault_kd: 0.5
+        gravity_ff_max_torque: 5.5   # model max 1.2 N.m; 1.69 + 1.5 <= 5
+        urdf_direction: 1            #
+        urdf_offset_deg: 0.0         
+        gravity_assume_deg: 0.0
     elbow:
       pitch:   # AK80-9, id 10
         velocity_max: 30.0
         delta_max: 1.6
-        # control_type: 0
-        # mit_family: ak
-        # mit_kp: 16.0
-        # mit_kd: 0.4
-        # mit_max_torque: 18.0
-        # mit_fault_kd: 0.5
-        # urdf_direction: -1            
-        # urdf_offset_deg: 0.0         
+        control_type: 0
+        mit_family: ak
+        mit_kp: 32.0
+        mit_kd: 0.4
+        mit_max_torque: 18.0
+        mit_fault_kd: 0.5
+        urdf_direction: -1            
+        urdf_offset_deg: 0.0         
         
-        # gravity_ff_scale: 0.9          # e.g. k = 1.8 -> start at HALF of k
-        # gravity_ff_max_torque: 3.59     # e.g. -- use the fit's suggestion
+        gravity_ff_scale: 0.9          
+        gravity_ff_max_torque: 3.59     
 
-        # gravity_assume_deg: 0.0
+        gravity_assume_deg: 0.0
       roll:    # AK80-9, id 13 -- least gravity load, bring up FIRST
         velocity_max: 30.0
         delta_max: 1.6
-        # control_type: 0
-        # mit_family: ak
-        # mit_kp: 8.0
-        # mit_kd: 0.4
-        # mit_max_torque: 5.0
-        # mit_fault_kd: 0.5
-        # gravity_ff_max_torque: 0.3   # model max 0.18 N.m
-        # urdf_direction: 1            
-        # urdf_offset_deg: 0.0         
+        control_type: 0
+        mit_family: ak
+        mit_kp: 36.0
+        mit_kd: 0.4
+        mit_max_torque: 18.0
+        mit_fault_kd: 0.5
+        gravity_ff_max_torque: 3.3   # model max 0.18 N.m
+        urdf_direction: 1            
+        urdf_offset_deg: 0.0         
 
-        # gravity_assume_deg: 0.0
+        gravity_assume_deg: 0.0
 
     # --- GL40 KV70 on a GL II drive, MIT_CONTROL ---------------------------
     # This joint is a PD drive: the motor applies
