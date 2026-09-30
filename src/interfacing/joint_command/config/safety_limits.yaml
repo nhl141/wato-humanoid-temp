@@ -140,19 +140,19 @@ safety:
 
         gravity_assume_deg: 0.0
       roll:    # AK80-9, id 13 -- least gravity load, bring up FIRST
-        velocity_max: 30.0
-        delta_max: 1.6
-        control_type: 0
-        mit_family: ak
-        mit_kp: 36.0
-        mit_kd: 0.4
-        mit_max_torque: 18.0
-        mit_fault_kd: 0.5
-        gravity_ff_max_torque: 3.3   # model max 0.18 N.m
-        urdf_direction: 1            
-        urdf_offset_deg: 0.0         
+        # velocity_max: 30.0
+        # delta_max: 1.6
+        # control_type: 0
+        # mit_family: ak
+        # mit_kp: 36.0
+        # mit_kd: 0.4
+        # mit_max_torque: 18.0
+        # mit_fault_kd: 0.5
+        # gravity_ff_max_torque: 3.3   # model max 0.18 N.m
+        # urdf_direction: 1            
+        # urdf_offset_deg: 0.0         
 
-        gravity_assume_deg: 0.0
+        # gravity_assume_deg: 0.0
 
     # --- GL40 KV70 on a GL II drive, MIT_CONTROL ---------------------------
     # This joint is a PD drive: the motor applies
